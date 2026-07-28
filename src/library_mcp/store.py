@@ -41,6 +41,17 @@ CREATE TABLE IF NOT EXISTS chunks (
     embedding TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_book ON chunks(book_id);
+CREATE TABLE IF NOT EXISTS knowledge_gaps (
+    id INTEGER PRIMARY KEY,
+    question TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    first_asked_at TEXT NOT NULL,
+    last_asked_at TEXT NOT NULL,
+    times_asked INTEGER NOT NULL DEFAULT 1,
+    resolved INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_gaps_question
+ON knowledge_gaps(question) WHERE resolved = 0;
 """
 
 # One partial unique index (content_hash IS NOT NULL) rather than a plain
@@ -79,6 +90,15 @@ class SearchResult:
     section: str | None
     text: str
     score: float
+
+
+@dataclass(frozen=True, slots=True)
+class KnowledgeGap:
+    question: str
+    reason: str
+    first_asked_at: str
+    last_asked_at: str
+    times_asked: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,6 +279,50 @@ def add_chunk(
 
 def commit(conn: sqlite3.Connection) -> None:
     conn.commit()
+
+
+def record_knowledge_gap(conn: sqlite3.Connection, question: str, reason: str, asked_at: str) -> None:
+    """Log a question the keeper couldn't answer -- deterministic call sites only.
+
+    Called from exactly two structural, code-driven signals in keeper_server.py
+    (max_searches exhausted with no answer, or zero search matches ever found)
+    -- never from parsing the model's own answer text for phrases like "I
+    don't know", which would depend on wording this stack's own model is only
+    40-60% reliable at producing consistently.
+
+    Re-asking the same exact question bumps `times_asked` and refreshes
+    `last_asked_at` rather than creating a duplicate row, so a question asked
+    by three different people shows up once, with a real repeat count.
+    """
+    existing = conn.execute(
+        "SELECT id, times_asked FROM knowledge_gaps WHERE question = ? AND resolved = 0",
+        (question,),
+    ).fetchone()
+    if existing is not None:
+        gap_id, times_asked = existing
+        conn.execute(
+            "UPDATE knowledge_gaps SET last_asked_at = ?, times_asked = ? WHERE id = ?",
+            (asked_at, times_asked + 1, gap_id),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO knowledge_gaps (question, reason, first_asked_at, last_asked_at, times_asked) "
+            "VALUES (?, ?, ?, ?, 1)",
+            (question, reason, asked_at, asked_at),
+        )
+    conn.commit()
+
+
+def list_knowledge_gaps(conn: sqlite3.Connection) -> list[KnowledgeGap]:
+    rows = conn.execute(
+        "SELECT question, reason, first_asked_at, last_asked_at, times_asked "
+        "FROM knowledge_gaps WHERE resolved = 0 "
+        "ORDER BY times_asked DESC, last_asked_at DESC"
+    ).fetchall()
+    return [
+        KnowledgeGap(question=q, reason=r, first_asked_at=fa, last_asked_at=la, times_asked=ta)
+        for q, r, fa, la, ta in rows
+    ]
 
 
 def _cosine(a: list[float], b: list[float]) -> float:

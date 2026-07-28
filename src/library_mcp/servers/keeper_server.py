@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from mcp.server.fastmcp import FastMCP
 
@@ -20,7 +21,9 @@ from library_mcp.config import KeeperPolicy, PolicyError, load_keeper_policy, po
 from library_mcp.embedding import EmbeddingClient, EmbeddingError
 from library_mcp.keeper_model import AnswerDecision, ReasoningClient, ReasoningError, SearchDecision
 from library_mcp.runtime import audit_from_env, build_app, serve
-from library_mcp.store import SearchResult, open_store, search
+from library_mcp.store import SearchResult
+from library_mcp.store import list_knowledge_gaps as list_knowledge_gaps_fn
+from library_mcp.store import open_store, record_knowledge_gap, search
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +93,8 @@ async def _ask(deps: _Deps, question: str) -> str:
     # Exhausted max_searches without an explicit answer -- return whatever
     # context was gathered rather than silently giving up.
     deps.audit.write(Event.ANSWER_FAILED, detail=question, reason="max_searches exhausted")
+    reason = "no_matches" if not all_results else "max_searches_exhausted"
+    record_knowledge_gap(conn, question, reason, datetime.now(UTC).isoformat())
     return (
         "I searched the library but couldn't settle on a confident answer. "
         f"Closest passages found:\n\n{_format_context(all_results, policy.max_context_chars)}"
@@ -110,6 +115,25 @@ def build_server(policy: KeeperPolicy, audit: AuditLog) -> FastMCP:
     )
     async def ask_library(question: str) -> str:
         return await _ask(deps, question)
+
+    @app.tool(
+        description=(
+            "List real questions the knowledge base couldn't confidently answer -- things "
+            "asked that turned up no matches, or where no confident answer could be settled "
+            "on. Use this to see what's worth adding a book/source for, not for answering "
+            "questions directly."
+        )
+    )
+    def list_knowledge_gaps() -> str:
+        conn = open_store(deps.policy.db_path)
+        gaps = list_knowledge_gaps_fn(conn)
+        if not gaps:
+            return "No open knowledge gaps -- every asked question found a confident answer."
+        lines = [
+            f"- \"{g.question}\" (asked {g.times_asked}x, last {g.last_asked_at}, reason: {g.reason})"
+            for g in gaps
+        ]
+        return f"{len(gaps)} open knowledge gap(s):\n" + "\n".join(lines)
 
     return app
 

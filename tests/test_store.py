@@ -10,8 +10,10 @@ from library_mcp.store import (
     commit,
     find_book_by_hash,
     list_book_statuses,
+    list_knowledge_gaps,
     mark_book_status,
     open_store,
+    record_knowledge_gap,
     search,
     update_book_progress,
 )
@@ -193,3 +195,39 @@ def test_progress_and_status_tracking(tmp_path: Path) -> None:
     mark_book_status(conn, book_id, "done")
     done = list_book_statuses(conn)[0]
     assert done.status == "done"
+
+
+def test_record_knowledge_gap_inserts_a_new_row(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "test.db")
+    record_knowledge_gap(conn, "what does the book say about X?", "no_matches", "2026-07-28T10:00:00")
+
+    gaps = list_knowledge_gaps(conn)
+    assert len(gaps) == 1
+    assert gaps[0].question == "what does the book say about X?"
+    assert gaps[0].reason == "no_matches"
+    assert gaps[0].times_asked == 1
+
+
+def test_record_knowledge_gap_dedupes_the_same_question(tmp_path: Path) -> None:
+    # Three different people asking the same unanswered question should
+    # show up once, with a real repeat count -- not three separate rows.
+    conn = open_store(tmp_path / "test.db")
+    record_knowledge_gap(conn, "what about X?", "no_matches", "2026-07-28T10:00:00")
+    record_knowledge_gap(conn, "what about X?", "no_matches", "2026-07-28T11:00:00")
+    record_knowledge_gap(conn, "what about X?", "no_matches", "2026-07-28T12:00:00")
+
+    gaps = list_knowledge_gaps(conn)
+    assert len(gaps) == 1
+    assert gaps[0].times_asked == 3
+    assert gaps[0].first_asked_at == "2026-07-28T10:00:00"
+    assert gaps[0].last_asked_at == "2026-07-28T12:00:00"
+
+
+def test_list_knowledge_gaps_orders_by_times_asked(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "test.db")
+    record_knowledge_gap(conn, "asked once", "no_matches", "2026-07-28T10:00:00")
+    record_knowledge_gap(conn, "asked twice", "no_matches", "2026-07-28T10:00:00")
+    record_knowledge_gap(conn, "asked twice", "no_matches", "2026-07-28T11:00:00")
+
+    gaps = list_knowledge_gaps(conn)
+    assert [g.question for g in gaps] == ["asked twice", "asked once"]

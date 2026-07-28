@@ -19,7 +19,13 @@ classifiers = [
   "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
-  "mcp>=1.28.1",
+  # Upper-bounded deliberately: mcp 2.0.0 (released mid-session, 2026-07-28)
+  # restructured the package and removed mcp.server.fastmcp entirely, which
+  # both servers import directly -- an unpinned floor-only constraint let
+  # one image build against 1.28.1 and a later rebuild of the other pull
+  # 2.0.0 and break at import time. Revisit the mcp 2.x migration
+  # deliberately, in its own pass, not as a silent side effect of a rebuild.
+  "mcp>=1.28.1,<2.0.0",
   "pydantic>=2.13.4",
   "PyYAML>=6.0.3",
   "httpx>=0.28.1",
