@@ -1,12 +1,11 @@
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+from conftest import run_and_wait
 from library_mcp.audit import AuditLog
 from library_mcp.config import ParsePolicy
 from library_mcp.servers.parse_server import _Deps, _forget, _learn_text
 from library_mcp.store import list_books, open_store
-
-from conftest import run_and_wait
 
 
 def _deps(tmp_path: Path) -> _Deps:

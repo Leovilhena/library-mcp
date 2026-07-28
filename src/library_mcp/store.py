@@ -20,6 +20,8 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
+from library_mcp.parser import TextBlock, detect_doc_type
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS books (
     id INTEGER PRIMARY KEY,
@@ -152,17 +154,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
     # re-reading source_path, when it's still a real file on disk (a
     # learn_text entry's source is a URL, not a file, and is correctly
     # left unhashed -- there's nothing to re-read for those).
-    rows = conn.execute(
-        "SELECT id, source_path FROM books WHERE content_hash IS NULL"
-    ).fetchall()
+    rows = conn.execute("SELECT id, source_path FROM books WHERE content_hash IS NULL").fetchall()
     for book_id, source_path in rows:
         path = Path(source_path)
         if not path.is_file():
             continue
         content_hash = hashlib.sha256(path.read_bytes()).hexdigest()
-        conn.execute(
-            "UPDATE books SET content_hash = ? WHERE id = ?", (content_hash, book_id)
-        )
+        conn.execute("UPDATE books SET content_hash = ? WHERE id = ?", (content_hash, book_id))
     # Classify books ingested before this feature existed, same "don't
     # leave already-ingested data unclassified" requirement as the
     # content_hash backfill above. Reuses chunks already stored in the
@@ -170,11 +168,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     # not exist any more (learn_text sources are URLs, not files) or may
     # have moved, and the chunk text is exactly what the classifier
     # needs anyway.
-    from library_mcp.parser import TextBlock, detect_doc_type
-
-    rows = conn.execute(
-        "SELECT id, source_path FROM books WHERE doc_type IS NULL"
-    ).fetchall()
+    rows = conn.execute("SELECT id, source_path FROM books WHERE doc_type IS NULL").fetchall()
     for book_id, source_path in rows:
         chunk_rows = conn.execute(
             "SELECT section, text FROM chunks WHERE book_id = ? ORDER BY chunk_index",
@@ -183,9 +177,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         blocks = [TextBlock(section=s, text=t) for s, t in chunk_rows]
         suffix = Path(source_path).suffix.lower() or None
         doc_type = detect_doc_type(blocks, suffix)
-        conn.execute(
-            "UPDATE books SET doc_type = ? WHERE id = ?", (doc_type, book_id)
-        )
+        conn.execute("UPDATE books SET doc_type = ? WHERE id = ?", (doc_type, book_id))
     conn.commit()
 
 
@@ -203,9 +195,7 @@ def open_store(path: Path) -> sqlite3.Connection:
 
 
 def find_book_by_hash(conn: sqlite3.Connection, content_hash: str) -> str | None:
-    row = conn.execute(
-        "SELECT title FROM books WHERE content_hash = ?", (content_hash,)
-    ).fetchone()
+    row = conn.execute("SELECT title FROM books WHERE content_hash = ?", (content_hash,)).fetchone()
     return row[0] if row else None
 
 
@@ -292,7 +282,9 @@ def commit(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def record_knowledge_gap(conn: sqlite3.Connection, question: str, reason: str, asked_at: str) -> None:
+def record_knowledge_gap(
+    conn: sqlite3.Connection, question: str, reason: str, asked_at: str
+) -> None:
     """Log a question the keeper couldn't answer -- deterministic call sites only.
 
     Called from two structural, code-driven signals in keeper_server.py's
@@ -321,7 +313,8 @@ def record_knowledge_gap(conn: sqlite3.Connection, question: str, reason: str, a
         )
     else:
         conn.execute(
-            "INSERT INTO knowledge_gaps (question, reason, first_asked_at, last_asked_at, times_asked) "
+            "INSERT INTO knowledge_gaps "
+            "(question, reason, first_asked_at, last_asked_at, times_asked) "
             "VALUES (?, ?, ?, ?, 1)",
             (question, reason, asked_at, asked_at),
         )
@@ -349,7 +342,9 @@ def _cosine(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
-def search(conn: sqlite3.Connection, query_embedding: list[float], top_k: int) -> list[SearchResult]:
+def search(
+    conn: sqlite3.Connection, query_embedding: list[float], top_k: int
+) -> list[SearchResult]:
     rows = conn.execute(
         "SELECT chunks.section, chunks.text, chunks.embedding, books.title "
         "FROM chunks JOIN books ON chunks.book_id = books.id"

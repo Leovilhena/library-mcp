@@ -77,8 +77,7 @@ class AuditLog:
             return
         if mode & 0o077:
             print(
-                f"[audit] WARNING: {parent} is mode {stat.S_IMODE(mode):04o}; "
-                "use mode 700.",
+                f"[audit] WARNING: {parent} is mode {stat.S_IMODE(mode):04o}; use mode 700.",
                 file=sys.stderr,
                 flush=True,
             )

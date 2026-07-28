@@ -46,6 +46,7 @@ _PLACEHOLDER_TITLES = {
     "document1",
     "new document",
 }
+_MAX_TITLE_CHARS = 300
 
 
 def _clean_title(raw: str | None) -> str | None:
@@ -60,7 +61,7 @@ def _clean_title(raw: str | None) -> str | None:
     if not raw:
         return None
     cleaned = raw.strip()
-    if not cleaned or len(cleaned) > 300:
+    if not cleaned or len(cleaned) > _MAX_TITLE_CHARS:
         return None
     if cleaned.lower() in _PLACEHOLDER_TITLES:
         return None
@@ -83,14 +84,18 @@ def extract_title(path: Path) -> str | None:
             meta = reader.metadata
             return _clean_title(getattr(meta, "title", None) if meta else None)
         if suffix == ".epub":
-            from ebooklib import epub
+            # Lazy, not top-level: mirrors extract_epub's own ImportError ->
+            # ParseError conversion below, so a broken ebooklib install fails
+            # gracefully here too instead of crashing the whole module at
+            # import time.
+            from ebooklib import epub  # noqa: PLC0415
 
             book = epub.read_epub(str(path))
             values = book.get_metadata("DC", "title")
             if values:
                 return _clean_title(values[0][0])
             return None
-    except Exception:  # noqa: BLE001 - metadata is a nice-to-have, never worth failing ingestion over
+    except Exception:
         return None
     return None
 
@@ -113,15 +118,18 @@ def extract_pdf(path: Path) -> list[TextBlock]:
         if text:
             blocks.append(TextBlock(section=f"page {i + 1}", text=text))
     if not blocks:
-        msg = f"{path.name}: no extractable text (likely a scanned/image-only PDF -- OCR not supported)"
+        msg = (
+            f"{path.name}: no extractable text "
+            "(likely a scanned/image-only PDF -- OCR not supported)"
+        )
         raise ParseError(msg)
     return blocks
 
 
 def extract_epub(path: Path) -> list[TextBlock]:
     try:
-        import ebooklib
-        from ebooklib import epub
+        import ebooklib  # noqa: PLC0415
+        from ebooklib import epub  # noqa: PLC0415
     except ImportError as exc:  # pragma: no cover - import-time dependency check
         msg = "ebooklib is not installed"
         raise ParseError(msg) from exc
@@ -208,11 +216,7 @@ def detect_doc_type(blocks: list[TextBlock], suffix: str | None = None) -> str:
     if article_signals >= _ARTICLE_MIN_SIGNALS:
         return "article"
 
-    if (
-        len(blocks) <= _NOTES_MAX_BLOCKS
-        and total_chars < _NOTES_MAX_CHARS
-        and article_signals == 0
-    ):
+    if len(blocks) <= _NOTES_MAX_BLOCKS and total_chars < _NOTES_MAX_CHARS and article_signals == 0:
         return "notes"
 
     return "book"

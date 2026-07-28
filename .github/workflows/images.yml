@@ -1,0 +1,78 @@
+name: Images
+
+on:
+  push:
+    branches: [master]
+    paths: ["Dockerfile.*", "src/**", "pyproject.toml", ".github/workflows/images.yml"]
+  pull_request:
+    paths: ["Dockerfile.*", "src/**", "pyproject.toml", ".github/workflows/images.yml"]
+  schedule:
+    # Base-image CVEs appear without anything in this repo changing, so the
+    # scan runs on a timer as well as on change.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  hadolint:
+    name: Dockerfile lint
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        dockerfile: [Dockerfile.parse, Dockerfile.keeper]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hadolint/hadolint-action@v3.3.0
+        with:
+          dockerfile: ${{ matrix.dockerfile }}
+          failure-threshold: warning
+
+  trivy:
+    name: Image CVEs (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: library-parse
+            dockerfile: Dockerfile.parse
+          - image: library-keeper
+            dockerfile: Dockerfile.keeper
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build
+        run: podman build -f ${{ matrix.dockerfile }} -t ${{ matrix.image }}:ci .
+
+      - name: Export for scanning
+        run: podman save -o /tmp/${{ matrix.image }}.tar ${{ matrix.image }}:ci
+
+      - name: Trivy (fail on CRITICAL)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          input: /tmp/${{ matrix.image }}.tar
+          severity: CRITICAL
+          scanners: vuln
+          format: table
+          exit-code: "1"
+
+      - name: Trivy (report HIGH+CRITICAL to code scanning)
+        uses: aquasecurity/trivy-action@v0.36.0
+        if: always()
+        with:
+          input: /tmp/${{ matrix.image }}.tar
+          severity: HIGH,CRITICAL
+          scanners: vuln
+          format: sarif
+          output: trivy-${{ matrix.image }}.sarif
+          exit-code: "0"
+
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: trivy-${{ matrix.image }}.sarif
+          category: trivy-${{ matrix.image }}

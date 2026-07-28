@@ -1,6 +1,6 @@
 import asyncio
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 _FIXTURES = Path(__file__).parent / "fixtures"
 

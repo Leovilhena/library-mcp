@@ -39,6 +39,9 @@ dev = [
   "pytest-asyncio>=1.4.0",
   "ruff>=0.16.0",
   "mypy>=2.3.0",
+  "bandit>=1.9.4",
+  "pip-audit>=2.10.1",
+  "types-PyYAML>=6.0.12.20260724",
   # Only used to generate real PDF fixtures for tests (conftest.py) --
   # never imported by the shipped package itself.
   "reportlab>=4.0",
@@ -59,10 +62,53 @@ line-length = 100
 target-version = "py311"
 src = ["src", "tests"]
 
+[tool.ruff.lint]
+select = [
+  "E", "F", "W",      # pycodestyle / pyflakes
+  "I",                # import sorting
+  "N",                # naming
+  "UP",               # pyupgrade
+  "S",                # flake8-bandit (security)
+  "B",                # bugbear
+  "A",                # builtin shadowing
+  "C4",               # comprehensions
+  "PT",               # pytest style
+  "RET",              # return simplification
+  "SIM",              # simplification
+  "ARG",              # unused arguments
+  "PTH",              # prefer pathlib
+  "PL",               # pylint subset
+  "RUF",
+]
+ignore = [
+  "PLR0913",  # many args is fine for the store's plain functions (matches sandbox-mcp)
+  "PLR0917",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests deliberately assert and construct raw SQL fixtures/magic numbers.
+"tests/**" = ["S101", "S608", "PLR2004", "PLC0415"]
+
 [tool.mypy]
 python_version = "3.11"
+strict = true
+warn_unreachable = true
 mypy_path = "src"
 packages = ["library_mcp"]
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+
+# ebooklib ships no py.typed marker/stubs.
+[[tool.mypy.overrides]]
+module = "ebooklib.*"
+ignore_missing_imports = true
+
+[tool.bandit]
+# Same reasoning as sandbox-mcp: tests intentionally construct hostile-shaped
+# inputs and use assert.
+exclude_dirs = ["tests"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

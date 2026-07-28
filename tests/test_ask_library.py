@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, patch
 from library_mcp.audit import AuditLog
 from library_mcp.config import KeeperPolicy
 from library_mcp.keeper_model import AnswerDecision, SearchDecision
-from library_mcp.servers.keeper_server import _Deps, _ask
+from library_mcp.servers.keeper_server import _ask, _Deps
 from library_mcp.store import add_book, add_chunk, commit, list_knowledge_gaps, open_store
 
 
@@ -51,7 +51,9 @@ async def test_ask_library_does_not_log_a_gap_when_answered(tmp_path: Path) -> N
         patch("library_mcp.servers.keeper_server.ReasoningClient") as mock_reason,
     ):
         mock_embed.return_value.embed = AsyncMock(return_value=[1.0, 0.0])
-        mock_reason.return_value.decide = AsyncMock(return_value=AnswerDecision(text="Here's the answer."))
+        mock_reason.return_value.decide = AsyncMock(
+            return_value=AnswerDecision(text="Here's the answer.")
+        )
 
         result = await _ask(deps, "a real question")
 
@@ -83,7 +85,9 @@ async def test_ask_library_logs_repeated_query_reason(tmp_path: Path) -> None:
         patch("library_mcp.servers.keeper_server.ReasoningClient") as mock_reason,
     ):
         mock_embed.return_value.embed = AsyncMock(return_value=[1.0, 0.0])
-        mock_reason.return_value.decide = AsyncMock(return_value=SearchDecision(query="still looking"))
+        mock_reason.return_value.decide = AsyncMock(
+            return_value=SearchDecision(query="still looking")
+        )
 
         await _ask(deps, "a hard question")
 

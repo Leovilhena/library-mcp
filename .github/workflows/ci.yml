@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Lint, types, unit tests (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.14 is what both runtime images are built on (Dockerfile.parse,
+        # Dockerfile.keeper). Testing the version we actually ship on is the
+        # point of having a matrix at all.
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install
+        run: pip install -e '.[dev]'
+
+      - name: Lint (ruff, includes flake8-bandit rules)
+        run: |
+          ruff check src tests
+          ruff format --check src tests
+
+      - name: Types (mypy --strict)
+        run: mypy
+
+      - name: Static security analysis (bandit)
+        run: bandit -q -c pyproject.toml -r src
+
+      - name: Tests
+        run: pytest
+
+  dependencies:
+    name: Dependency CVEs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+
+      - name: pip-audit
+        run: pip-audit --skip-editable --progress-spinner=off

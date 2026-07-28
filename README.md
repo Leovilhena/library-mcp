@@ -1,7 +1,18 @@
+<div align="center">
+
 # library-mcp
 
 A specialized "library keeper" sub-agent for the Pythia stack: ingest PDF/EPUB
 books, then answer questions grounded in them via local embedding search.
+
+[![CI](https://github.com/Leovilhena/library-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/Leovilhena/library-mcp/actions/workflows/ci.yml)
+[![Images](https://github.com/Leovilhena/library-mcp/actions/workflows/images.yml/badge.svg)](https://github.com/Leovilhena/library-mcp/actions/workflows/images.yml)
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)](pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Checked with mypy](https://img.shields.io/badge/mypy-strict-2a6db2)](pyproject.toml)
+[![Linted with ruff](https://img.shields.io/badge/ruff-passing-261230)](pyproject.toml)
+
+</div>
 
 Two MCP servers, one shared knowledge base:
 
@@ -27,17 +38,16 @@ Two MCP servers, one shared knowledge base:
   - `list_knowledge_gaps()` lists open gaps — questions worth adding a
     source for — for human review.
 
-Every embedding/reasoning call goes to one address set in policy at
-startup — never a tool argument, never document content — so there's no
-attacker-influenceable fetch target anywhere in this project, unlike a
-general-purpose web fetcher.
+Both servers always talk to the same fixed local address for embeddings and
+reasoning — that address is set once, in a config file, and can't be changed
+by a book's content or by anything a user types. So there's nothing in a PDF
+or a chat message that could redirect this to some other server.
 
-Full design, threat model, and the real findings from building this
-(a reasoning model's format-compliance failure, a retrieval-quality bug from
-EPUB table-of-contents noise, a `podman --userns keep-id` permissions
-gotcha) are in the Pythia stack's own docs:
-`hermes-stack/docs/architecture/library-mcp.md` and
-`hermes-stack/docs/decisions/0004-*.md` / `0005-*.md`.
+More on how this was actually built and debugged — including the real bugs
+found along the way (a small reasoning model not following instructions
+reliably, an EPUB's table of contents accidentally confusing search results,
+a tricky container-permissions issue) — is written up in the Pythia stack's
+own docs: `hermes-stack/docs/architecture/library-mcp.md`.
 
 ## Development
 

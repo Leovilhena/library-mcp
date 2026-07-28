@@ -21,9 +21,8 @@ from library_mcp.config import KeeperPolicy, PolicyError, load_keeper_policy, po
 from library_mcp.embedding import EmbeddingClient, EmbeddingError
 from library_mcp.keeper_model import AnswerDecision, ReasoningClient, ReasoningError, SearchDecision
 from library_mcp.runtime import audit_from_env, build_app, serve
-from library_mcp.store import SearchResult
+from library_mcp.store import SearchResult, open_store, record_knowledge_gap, search
 from library_mcp.store import list_knowledge_gaps as list_knowledge_gaps_fn
-from library_mcp.store import open_store, record_knowledge_gap, search
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,8 +48,12 @@ async def _ask(deps: _Deps, question: str) -> str:
     deps.audit.write(Event.ASKED, detail=question)
 
     conn = open_store(policy.db_path)
-    embedder = EmbeddingClient(policy.ollama_base_url, policy.embedding_model, policy.embed_timeout_seconds)
-    reasoner = ReasoningClient(policy.ollama_base_url, policy.reasoning_model, policy.reasoning_timeout_seconds)
+    embedder = EmbeddingClient(
+        policy.ollama_base_url, policy.embedding_model, policy.embed_timeout_seconds
+    )
+    reasoner = ReasoningClient(
+        policy.ollama_base_url, policy.reasoning_model, policy.reasoning_timeout_seconds
+    )
 
     query = question
     all_results: list[SearchResult] = []
@@ -80,7 +83,9 @@ async def _ask(deps: _Deps, question: str) -> str:
         try:
             decision = await reasoner.decide(query, context, remaining)
         except ReasoningError as exc:
-            deps.audit.write(Event.ANSWER_FAILED, detail=question, reason=f"reasoning failed: {exc}")
+            deps.audit.write(
+                Event.ANSWER_FAILED, detail=question, reason=f"reasoning failed: {exc}"
+            )
             return "I couldn't reason over the retrieved passages right now."
 
         if isinstance(decision, AnswerDecision):
@@ -142,7 +147,7 @@ def build_server(policy: KeeperPolicy, audit: AuditLog) -> FastMCP:
         if not gaps:
             return "No open knowledge gaps recorded."
         lines = [
-            f"- \"{g.question}\" (asked {g.times_asked}x, last {g.last_asked_at}, reason: {g.reason})"
+            f'- "{g.question}" (asked {g.times_asked}x, last {g.last_asked_at}, reason: {g.reason})'
             for g in gaps
         ]
         return f"{len(gaps)} open knowledge gap(s):\n" + "\n".join(lines)

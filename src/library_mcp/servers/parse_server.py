@@ -51,6 +51,25 @@ class _Deps:
     audit: AuditLog
 
 
+# asyncio only holds a *weak* reference to a task once nothing else does --
+# per the stdlib's own docs, a task can be garbage-collected mid-run if its
+# creator doesn't keep a reference. `_learn`/`_learn_text` fire the
+# background ingestion job and return immediately, so without this there
+# would be nothing keeping the task alive between event-loop iterations.
+# Found by CI's ruff security/correctness rules (RUF006), not by observing
+# an actual dropped ingestion -- exactly the class of bug that's real but
+# intermittent enough to not show up in ordinary testing.
+_background_tasks: set[asyncio.Task[None]] = set()
+
+
+def _spawn_background_ingest(
+    deps: _Deps, title: str, source: str, content_hash: str, blocks: list[TextBlock]
+) -> None:
+    task = asyncio.create_task(_ingest_in_background(deps, title, source, content_hash, blocks))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
 def _resolve_within(root: Path, file_name: str) -> Path | None:
     """Resolve a caller-given name against one root, refusing any escape.
 
@@ -139,7 +158,9 @@ def _resolve_source(policy: ParsePolicy, file_name: str) -> tuple[Path, bool]:
     raise ParseError(msg)
 
 
-async def _ingest_in_background(deps: _Deps, title: str, source: str, content_hash: str, blocks: list[TextBlock]) -> None:
+async def _ingest_in_background(
+    deps: _Deps, title: str, source: str, content_hash: str, blocks: list[TextBlock]
+) -> None:
     """Parse-to-chunks is already done by the caller; this does the slow part
     (embedding, one HTTP call per chunk) off the tool-call path.
 
@@ -151,7 +172,9 @@ async def _ingest_in_background(deps: _Deps, title: str, source: str, content_ha
     """
     policy = deps.policy
     chunks = chunk_blocks(blocks, policy.chunk_chars, policy.chunk_overlap_chars)
-    embedder = EmbeddingClient(policy.ollama_base_url, policy.embedding_model, policy.embed_timeout_seconds)
+    embedder = EmbeddingClient(
+        policy.ollama_base_url, policy.embedding_model, policy.embed_timeout_seconds
+    )
     conn = open_store(policy.db_path)
     doc_type = detect_doc_type(blocks, Path(source).suffix.lower() or None)
 
@@ -180,17 +203,28 @@ async def _ingest_in_background(deps: _Deps, title: str, source: str, content_ha
             except EmbeddingError as exc:
                 deps.audit.write(Event.EMBED_FAILED, detail=title, reason=str(exc), chunk_index=i)
                 continue
-            add_chunk(conn, book_id=book_id, chunk_index=i, section=chunk.section, text=chunk.text, embedding=vector)
+            add_chunk(
+                conn,
+                book_id=book_id,
+                chunk_index=i,
+                section=chunk.section,
+                text=chunk.text,
+                embedding=vector,
+            )
             embedded += 1
             update_book_progress(conn, book_id, embedded)
-    except Exception as exc:  # noqa: BLE001 - fire-and-forget task, nothing else will see this
+    except Exception as exc:
         mark_book_status(conn, book_id, "failed")
         deps.audit.write(Event.INGEST_FAILED, detail=title, reason=f"unexpected error: {exc}")
         return
 
     mark_book_status(conn, book_id, "done" if embedded > 0 else "failed")
     deps.audit.write(
-        Event.INGESTED, detail=title, source=source, chunks_total=len(chunks), chunks_embedded=embedded
+        Event.INGESTED,
+        detail=title,
+        source=source,
+        chunks_total=len(chunks),
+        chunks_embedded=embedded,
     )
 
 
@@ -214,7 +248,9 @@ def _learn(deps: _Deps, file_name: str) -> str:
 
     size_mb = path.stat().st_size / (1024 * 1024)
     if size_mb > policy.max_file_mb:
-        deps.audit.write(Event.INGEST_DENIED, detail=file_name, reason=f"{size_mb:.1f}MB over limit")
+        deps.audit.write(
+            Event.INGEST_DENIED, detail=file_name, reason=f"{size_mb:.1f}MB over limit"
+        )
         return f"'{file_name}' is {size_mb:.1f}MB, over the {policy.max_file_mb}MB limit."
 
     content_hash = _hash_bytes(path.read_bytes())
@@ -234,7 +270,7 @@ def _learn(deps: _Deps, file_name: str) -> str:
     # numeric or otherwise meaningless filename (e.g. "1234567.pdf") is
     # exactly the case this matters for.
     title = extract_title(path) or path.stem
-    asyncio.create_task(_ingest_in_background(deps, title, str(path), content_hash, blocks))
+    _spawn_background_ingest(deps, title, str(path), content_hash, blocks)
     page_or_section_count = len(blocks)
     return (
         f"Started learning '{title}' ({page_or_section_count} section(s)) in the background -- "
@@ -272,8 +308,8 @@ def _learn_text(deps: _Deps, title: str, text: str, source_url: str) -> str:
         return f"You already have this content: '{existing}'."
 
     blocks = [TextBlock(section=None, text=text)]
-    asyncio.create_task(
-        _ingest_in_background(deps, title, source_url or "(no source url given)", content_hash, blocks)
+    _spawn_background_ingest(
+        deps, title, source_url or "(no source url given)", content_hash, blocks
     )
     return f"Started learning '{title}' in the background."
 
@@ -304,7 +340,9 @@ def _forget(deps: _Deps, title: str) -> str:
         if len(exact) == 1:
             matches = exact
         else:
-            deps.audit.write(Event.DELETE_DENIED, detail=title, reason=f"{len(matches)} matches, ambiguous")
+            deps.audit.write(
+                Event.DELETE_DENIED, detail=title, reason=f"{len(matches)} matches, ambiguous"
+            )
             titles = "\n".join(f"- {t}" for _, t in matches)
             return f"'{title}' matches more than one book -- be more specific:\n{titles}"
     book_id, matched_title = matches[0]
@@ -371,13 +409,16 @@ def build_server(policy: ParsePolicy, audit: AuditLog) -> FastMCP:
             doc_type_tag = f"[{b.doc_type}] " if b.doc_type else ""
             if b.status == "embedding":
                 lines.append(
-                    f"- {doc_type_tag}{b.title} (embedding: {b.embedded_chunks}/{b.total_chunks} chunks)"
+                    f"- {doc_type_tag}{b.title} "
+                    f"(embedding: {b.embedded_chunks}/{b.total_chunks} chunks)"
                 )
             elif b.status == "failed":
                 lines.append(f"- {doc_type_tag}{b.title} (failed -- check the audit log)")
             else:
                 lines.append(f"- {doc_type_tag}{b.title} ({b.embedded_chunks} chunks)")
-        return f"{book_count(conn)} book(s), {chunk_count(conn)} chunk(s) total:\n" + "\n".join(lines)
+        return f"{book_count(conn)} book(s), {chunk_count(conn)} chunk(s) total:\n" + "\n".join(
+            lines
+        )
 
     return app
 

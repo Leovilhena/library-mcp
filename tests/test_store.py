@@ -144,7 +144,8 @@ def test_open_store_backfills_doc_type_as_book_for_a_real_shaped_book(tmp_path: 
     long_text = "Chapter body text discussing the subject at length. " * 100
     for i in range(8):
         old_conn.execute(
-            "INSERT INTO chunks (book_id, chunk_index, section, text, embedding) VALUES (1, ?, ?, ?, '[1.0]')",
+            "INSERT INTO chunks (book_id, chunk_index, section, text, embedding) "
+            "VALUES (1, ?, ?, ?, '[1.0]')",
             (i, f"page {i}", long_text),
         )
     old_conn.commit()
@@ -156,7 +157,9 @@ def test_open_store_backfills_doc_type_as_book_for_a_real_shaped_book(tmp_path: 
     assert statuses[0].doc_type == "book"
 
 
-def test_content_hash_backfill_retries_on_a_later_open_when_file_was_missing(tmp_path: Path) -> None:
+def test_content_hash_backfill_retries_on_a_later_open_when_file_was_missing(
+    tmp_path: Path,
+) -> None:
     # Real bug caught by review: library-parse and library-keeper are two
     # separate processes sharing this db with no ordering between them, and
     # only library-parse's container can read source files. If keeper
@@ -240,7 +243,9 @@ def test_find_book_by_hash(tmp_path: Path) -> None:
 
 def test_progress_and_status_tracking(tmp_path: Path) -> None:
     conn = open_store(tmp_path / "test.db")
-    book_id = add_book(conn, "Title", "/inbox/a.pdf", "2026-01-01", status="embedding", total_chunks=10)
+    book_id = add_book(
+        conn, "Title", "/inbox/a.pdf", "2026-01-01", status="embedding", total_chunks=10
+    )
 
     update_book_progress(conn, book_id, 5)
     mid = list_book_statuses(conn)[0]
@@ -255,7 +260,9 @@ def test_progress_and_status_tracking(tmp_path: Path) -> None:
 
 def test_record_knowledge_gap_inserts_a_new_row(tmp_path: Path) -> None:
     conn = open_store(tmp_path / "test.db")
-    record_knowledge_gap(conn, "what does the book say about X?", "no_matches", "2026-07-28T10:00:00")
+    record_knowledge_gap(
+        conn, "what does the book say about X?", "no_matches", "2026-07-28T10:00:00"
+    )
 
     gaps = list_knowledge_gaps(conn)
     assert len(gaps) == 1
