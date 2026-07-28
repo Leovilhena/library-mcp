@@ -27,15 +27,22 @@ class EmbeddingClient:
         self._model = model
         self._timeout = timeout_seconds
 
-    def embed(self, text: str) -> list[float]:
+    async def embed(self, text: str) -> list[float]:
+        """Async so a long ingestion (hundreds of sequential calls) doesn't
+        block the event loop for the whole server -- a synchronous client
+        here meant `ask_library` (and every other request) stalled for the
+        entire duration of any `learn` call in progress. Found live
+        2026-07-28: a 14 MB book took long enough to embed that it looked
+        like the tool had hung.
+        """
         try:
-            response = httpx.post(
-                f"{self._base_url}/api/embeddings",
-                json={"model": self._model, "prompt": text, "keep_alive": "30s"},
-                timeout=self._timeout,
-            )
-            response.raise_for_status()
-            data = response.json()
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                response = await client.post(
+                    f"{self._base_url}/api/embeddings",
+                    json={"model": self._model, "prompt": text, "keep_alive": "30s"},
+                )
+                response.raise_for_status()
+                data = response.json()
         except httpx.HTTPError as exc:
             msg = f"embedding request failed: {exc}"
             raise EmbeddingError(msg) from exc

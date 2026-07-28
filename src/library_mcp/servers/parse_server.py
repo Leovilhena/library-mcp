@@ -7,6 +7,8 @@ docs/architecture/library-mcp.md.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -19,7 +21,18 @@ from library_mcp.config import ParsePolicy, PolicyError, load_parse_policy, poli
 from library_mcp.embedding import EmbeddingClient, EmbeddingError
 from library_mcp.parser import ParseError, TextBlock, chunk_blocks, extract
 from library_mcp.runtime import audit_from_env, build_app, serve
-from library_mcp.store import add_book, add_chunk, book_count, chunk_count, commit, list_books, open_store
+from library_mcp.store import (
+    DuplicateBookError,
+    add_book,
+    add_chunk,
+    book_count,
+    chunk_count,
+    find_book_by_hash,
+    list_book_statuses,
+    mark_book_status,
+    open_store,
+    update_book_progress,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,34 +78,61 @@ def _resolve_source(policy: ParsePolicy, file_name: str) -> Path:
     raise ParseError(msg)
 
 
-def _ingest_blocks(deps: _Deps, title: str, source: str, blocks: list[TextBlock]) -> str:
+async def _ingest_in_background(deps: _Deps, title: str, source: str, content_hash: str, blocks: list[TextBlock]) -> None:
+    """Parse-to-chunks is already done by the caller; this does the slow part
+    (embedding, one HTTP call per chunk) off the tool-call path.
+
+    Runs detached (fire-and-forget via asyncio.create_task), so every
+    failure mode has to be caught and recorded here -- nothing propagates
+    back to a caller that already got its response. Progress is written to
+    the books table as it goes, so list_learned reflects real state rather
+    than the caller having to guess whether a long ingestion finished.
+    """
     policy = deps.policy
     chunks = chunk_blocks(blocks, policy.chunk_chars, policy.chunk_overlap_chars)
     embedder = EmbeddingClient(policy.ollama_base_url, policy.embedding_model, policy.embed_timeout_seconds)
-
     conn = open_store(policy.db_path)
-    book_id = add_book(conn, title=title, source_path=source, ingested_at=datetime.now(UTC).isoformat())
+
+    try:
+        book_id = add_book(
+            conn,
+            title=title,
+            source_path=source,
+            ingested_at=datetime.now(UTC).isoformat(),
+            content_hash=content_hash,
+            status="embedding",
+            total_chunks=len(chunks),
+        )
+    except DuplicateBookError as exc:
+        # Race: another learn() call for the same content finished first,
+        # between this call's earlier duplicate check and now.
+        deps.audit.write(Event.INGEST_DENIED, detail=title, reason=str(exc))
+        return
 
     embedded = 0
-    for i, chunk in enumerate(chunks):
-        try:
-            vector = embedder.embed(chunk.text)
-        except EmbeddingError as exc:
-            deps.audit.write(Event.EMBED_FAILED, detail=title, reason=str(exc), chunk_index=i)
-            continue
-        add_chunk(conn, book_id=book_id, chunk_index=i, section=chunk.section, text=chunk.text, embedding=vector)
-        embedded += 1
-    commit(conn)
+    try:
+        for i, chunk in enumerate(chunks):
+            try:
+                vector = await embedder.embed(chunk.text)
+            except EmbeddingError as exc:
+                deps.audit.write(Event.EMBED_FAILED, detail=title, reason=str(exc), chunk_index=i)
+                continue
+            add_chunk(conn, book_id=book_id, chunk_index=i, section=chunk.section, text=chunk.text, embedding=vector)
+            embedded += 1
+            update_book_progress(conn, book_id, embedded)
+    except Exception as exc:  # noqa: BLE001 - fire-and-forget task, nothing else will see this
+        mark_book_status(conn, book_id, "failed")
+        deps.audit.write(Event.INGEST_FAILED, detail=title, reason=f"unexpected error: {exc}")
+        return
 
+    mark_book_status(conn, book_id, "done" if embedded > 0 else "failed")
     deps.audit.write(
         Event.INGESTED, detail=title, source=source, chunks_total=len(chunks), chunks_embedded=embedded
     )
-    if embedded < len(chunks):
-        return (
-            f"Learned '{title}': {embedded}/{len(chunks)} chunks embedded "
-            f"({len(chunks) - embedded} failed -- check the audit log)."
-        )
-    return f"Learned '{title}': {embedded} chunks from {len(blocks)} section(s)."
+
+
+def _hash_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
 def _learn(deps: _Deps, file_name: str) -> str:
@@ -112,13 +152,27 @@ def _learn(deps: _Deps, file_name: str) -> str:
         deps.audit.write(Event.INGEST_DENIED, detail=file_name, reason=f"{size_mb:.1f}MB over limit")
         return f"'{file_name}' is {size_mb:.1f}MB, over the {policy.max_file_mb}MB limit."
 
+    content_hash = _hash_bytes(path.read_bytes())
+    conn = open_store(policy.db_path)
+    existing = find_book_by_hash(conn, content_hash)
+    if existing is not None:
+        deps.audit.write(Event.INGEST_DENIED, detail=file_name, reason=f"duplicate of {existing!r}")
+        return f"You already have this book: '{existing}'."
+
     try:
         blocks = extract(path)
     except ParseError as exc:
         deps.audit.write(Event.INGEST_FAILED, detail=file_name, reason=str(exc))
         return f"Could not learn '{file_name}': {exc}"
 
-    return _ingest_blocks(deps, title=path.stem, source=str(path), blocks=blocks)
+    title = path.stem
+    asyncio.create_task(_ingest_in_background(deps, title, str(path), content_hash, blocks))
+    page_or_section_count = len(blocks)
+    return (
+        f"Started learning '{title}' ({page_or_section_count} section(s)) in the background -- "
+        "this can take a few minutes for a long book. Check list_learned for progress, or just "
+        "ask ask_library later; chunks become searchable as they finish embedding."
+    )
 
 
 def _learn_text(deps: _Deps, title: str, text: str, source_url: str) -> str:
@@ -142,8 +196,18 @@ def _learn_text(deps: _Deps, title: str, text: str, source_url: str) -> str:
         deps.audit.write(Event.INGEST_DENIED, detail=title, reason=f"{len(text)} chars over limit")
         return f"'{title}' is {len(text)} chars, over the ~{max_chars} char limit."
 
+    content_hash = _hash_bytes(text.encode("utf-8"))
+    conn = open_store(policy.db_path)
+    existing = find_book_by_hash(conn, content_hash)
+    if existing is not None:
+        deps.audit.write(Event.INGEST_DENIED, detail=title, reason=f"duplicate of {existing!r}")
+        return f"You already have this content: '{existing}'."
+
     blocks = [TextBlock(section=None, text=text)]
-    return _ingest_blocks(deps, title=title, source=source_url or "(no source url given)", blocks=blocks)
+    asyncio.create_task(
+        _ingest_in_background(deps, title, source_url or "(no source url given)", content_hash, blocks)
+    )
+    return f"Started learning '{title}' in the background."
 
 
 def build_server(policy: ParsePolicy, audit: AuditLog) -> FastMCP:
@@ -154,7 +218,9 @@ def build_server(policy: ParsePolicy, audit: AuditLog) -> FastMCP:
         description=(
             "Learn a book (PDF or EPUB) by file name -- checks both the shared inbox directory "
             "and recently received chat attachments (e.g. a PDF the user just sent on Telegram). "
-            "Chunks and embeds it into the knowledge base so ask_library can search it later. "
+            "Chunks and embeds it into the knowledge base in the background (returns immediately; "
+            "a long book can take minutes to fully embed) so ask_library can search it later. "
+            "Refuses if this exact content is already in the knowledge base. "
             "Give just the file name (e.g. 'networking-with-python.pdf'), not a full path. "
             "Note: this is a normal tool call, not the '/learn' slash command -- that command "
             "extracts a reusable skill from the conversation and is unrelated to books."
@@ -167,22 +233,34 @@ def build_server(policy: ParsePolicy, audit: AuditLog) -> FastMCP:
         description=(
             "Learn from already-fetched text (e.g. a web page returned by sandbox_fetch), "
             "not a file. Use this to add a fetched link's content to the knowledge base -- "
-            "give it the title to file this under, the fetched text itself, and the source URL."
+            "give it the title to file this under, the fetched text itself, and the source URL. "
+            "Runs in the background like learn(); refuses if this exact content is already known."
         )
     )
     def learn_text(title: str, text: str, source_url: str = "") -> str:
         return _learn_text(deps, title, text, source_url)
 
-    @app.tool(description="List every book currently in the knowledge base.")
+    @app.tool(
+        description=(
+            "List every book in the knowledge base, including ones still being embedded "
+            "in the background, with progress."
+        )
+    )
     def list_learned() -> str:
         conn = open_store(deps.policy.db_path)
-        titles = list_books(conn)
-        deps.audit.write(Event.LISTED, books=len(titles), chunks=chunk_count(conn))
-        if not titles:
+        statuses = list_book_statuses(conn)
+        deps.audit.write(Event.LISTED, books=len(statuses), chunks=chunk_count(conn))
+        if not statuses:
             return "No books learned yet."
-        return f"{book_count(conn)} book(s), {chunk_count(conn)} chunk(s) total:\n" + "\n".join(
-            f"- {t}" for t in titles
-        )
+        lines = []
+        for b in statuses:
+            if b.status == "embedding":
+                lines.append(f"- {b.title} (embedding: {b.embedded_chunks}/{b.total_chunks} chunks)")
+            elif b.status == "failed":
+                lines.append(f"- {b.title} (failed -- check the audit log)")
+            else:
+                lines.append(f"- {b.title} ({b.embedded_chunks} chunks)")
+        return f"{book_count(conn)} book(s), {chunk_count(conn)} chunk(s) total:\n" + "\n".join(lines)
 
     return app
 

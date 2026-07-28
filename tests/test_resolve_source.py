@@ -1,9 +1,12 @@
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from library_mcp.audit import AuditLog
 from library_mcp.config import ParsePolicy
 from library_mcp.servers.parse_server import _Deps, _learn
+from library_mcp.store import list_books, open_store
+
+from conftest import run_and_wait
 
 
 def _deps(tmp_path: Path, documents_path: Path | None) -> _Deps:
@@ -18,7 +21,7 @@ def _deps(tmp_path: Path, documents_path: Path | None) -> _Deps:
     return _Deps(policy=policy, audit=AuditLog(tmp_path / "audit.jsonl"))
 
 
-def test_learn_finds_file_in_telegram_document_cache_not_just_inbox(tmp_path: Path) -> None:
+async def test_learn_finds_file_in_telegram_document_cache_not_just_inbox(tmp_path: Path) -> None:
     # The exact real bug: a PDF sent via Telegram lands in Hermes' generic
     # attachment cache, not the dedicated inbox. learn() must still find it.
     documents = tmp_path / "documents"
@@ -28,13 +31,15 @@ def test_learn_finds_file_in_telegram_document_cache_not_just_inbox(tmp_path: Pa
 
     deps = _deps(tmp_path, documents_path=documents)
     with patch("library_mcp.servers.parse_server.EmbeddingClient") as mock_client:
-        mock_client.return_value.embed.return_value = [1.0, 0.0]
-        result = _learn(deps, "networking-with-python.pdf")
+        mock_client.return_value.embed = AsyncMock(return_value=[1.0, 0.0])
+        result = await run_and_wait(_learn, deps, "networking-with-python.pdf")
 
-    assert "Learned" in result
+    assert "Started learning" in result
+    conn = open_store(deps.policy.db_path)
+    assert list_books(conn)  # actually finished ingesting, not just accepted
 
 
-def test_learn_prefers_inbox_over_documents_when_both_have_it(tmp_path: Path) -> None:
+async def test_learn_prefers_inbox_over_documents_when_both_have_it(tmp_path: Path) -> None:
     documents = tmp_path / "documents"
     documents.mkdir()
     (documents / "same-name.pdf").write_bytes(b"should not be used")
@@ -43,10 +48,10 @@ def test_learn_prefers_inbox_over_documents_when_both_have_it(tmp_path: Path) ->
     (deps.policy.inbox_path / "same-name.pdf").write_bytes(fixture.read_bytes())
 
     with patch("library_mcp.servers.parse_server.EmbeddingClient") as mock_client:
-        mock_client.return_value.embed.return_value = [1.0, 0.0]
-        result = _learn(deps, "same-name.pdf")
+        mock_client.return_value.embed = AsyncMock(return_value=[1.0, 0.0])
+        result = await run_and_wait(_learn, deps, "same-name.pdf")
 
-    assert "Learned" in result  # the real PDF parsed cleanly, not the bogus bytes
+    assert "Started learning" in result  # the real PDF parsed cleanly, not the bogus bytes
 
 
 def test_learn_refuses_when_not_in_either_root(tmp_path: Path) -> None:
@@ -60,3 +65,24 @@ def test_learn_works_without_documents_path_configured(tmp_path: Path) -> None:
     deps = _deps(tmp_path, documents_path=None)
     result = _learn(deps, "nonexistent.pdf")
     assert "Refused" in result
+
+
+async def test_learn_refuses_duplicate_file(tmp_path: Path) -> None:
+    documents = tmp_path / "documents"
+    documents.mkdir()
+    fixture = Path(__file__).parent / "fixtures" / "networking-with-python.pdf"
+    (documents / "networking-with-python.pdf").write_bytes(fixture.read_bytes())
+    # A re-upload of the identical file, e.g. Hermes' cache assigning it a
+    # new doc_<hash>_ prefix on a second Telegram send -- different name,
+    # identical bytes.
+    (documents / "networking-with-python-copy.pdf").write_bytes(fixture.read_bytes())
+
+    deps = _deps(tmp_path, documents_path=documents)
+    with patch("library_mcp.servers.parse_server.EmbeddingClient") as mock_client:
+        mock_client.return_value.embed = AsyncMock(return_value=[1.0, 0.0])
+        await run_and_wait(_learn, deps, "networking-with-python.pdf")
+        result = _learn(deps, "networking-with-python-copy.pdf")
+
+    assert "already have this book" in result
+    conn = open_store(deps.policy.db_path)
+    assert len(list_books(conn)) == 1

@@ -41,7 +41,7 @@ def _format_context(results: list[SearchResult], max_chars: int) -> str:
     return "\n".join(parts) if parts else "(no matching passages found)"
 
 
-def _ask(deps: _Deps, question: str) -> str:
+async def _ask(deps: _Deps, question: str) -> str:
     policy = deps.policy
     deps.audit.write(Event.ASKED, detail=question)
 
@@ -60,7 +60,7 @@ def _ask(deps: _Deps, question: str) -> str:
             break
         seen_queries.add(query)
         try:
-            query_vector = embedder.embed(query)
+            query_vector = await embedder.embed(query)
         except EmbeddingError as exc:
             deps.audit.write(Event.ANSWER_FAILED, detail=question, reason=f"embed failed: {exc}")
             return "I couldn't search the library right now (embedding call failed)."
@@ -75,7 +75,7 @@ def _ask(deps: _Deps, question: str) -> str:
         context = _format_context(all_results, policy.max_context_chars)
         remaining = policy.max_searches - attempt - 1
         try:
-            decision = reasoner.decide(query, context, remaining)
+            decision = await reasoner.decide(query, context, remaining)
         except ReasoningError as exc:
             deps.audit.write(Event.ANSWER_FAILED, detail=question, reason=f"reasoning failed: {exc}")
             return "I couldn't reason over the retrieved passages right now."
@@ -108,8 +108,8 @@ def build_server(policy: KeeperPolicy, audit: AuditLog) -> FastMCP:
             "answering from your own memory when the question is about specific book content."
         )
     )
-    def ask_library(question: str) -> str:
-        return _ask(deps, question)
+    async def ask_library(question: str) -> str:
+        return await _ask(deps, question)
 
     return app
 

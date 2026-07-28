@@ -57,23 +57,23 @@ class ReasoningClient:
         self._model = model
         self._timeout = timeout_seconds
 
-    def decide(self, question: str, context: str, remaining_searches: int) -> Decision:
+    async def decide(self, question: str, context: str, remaining_searches: int) -> Decision:
         prompt = _PROMPT_TEMPLATE.format(
             question=question, context=context, remaining=remaining_searches
         )
         try:
-            response = httpx.post(
-                f"{self._base_url}/api/generate",
-                json={
-                    "model": self._model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "keep_alive": "30s",
-                },
-                timeout=self._timeout,
-            )
-            response.raise_for_status()
-            data = response.json()
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                response = await client.post(
+                    f"{self._base_url}/api/generate",
+                    json={
+                        "model": self._model,
+                        "prompt": prompt,
+                        "stream": False,
+                        "keep_alive": "30s",
+                    },
+                )
+                response.raise_for_status()
+                data = response.json()
         except httpx.HTTPError as exc:
             msg = f"reasoning request failed: {exc}"
             raise ReasoningError(msg) from exc
