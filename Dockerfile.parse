@@ -1,0 +1,49 @@
+# syntax=docker/dockerfile:1
+FROM python:3.14-slim AS build
+
+WORKDIR /build
+COPY pyproject.toml README.md LICENSE ./
+COPY src/ src/
+RUN pip install --no-cache-dir --target=/install .
+
+FROM python:3.14-slim
+
+# Doesn't execute arbitrary code from an untrusted actor per call (unlike
+# sandbox-exec) -- it parses a fixed set of file types and calls one
+# hardcoded embedding endpoint. A single unprivileged user for the whole
+# process is the right fit, same model as sandbox-fetch, not the
+# per-call privilege-drop dance sandbox-exec needs.
+#
+# Same uid/gid (10004) as library-keeper's image, deliberately -- both
+# containers need read-write access to the same shared knowledge.db, and
+# matching identities is what makes that work without a 777 directory (the
+# project already moved away from that once, see hardening-log.md). They
+# aren't adversarial toward each other the way exec/fetch are toward
+# untrusted input, so sharing this one identity doesn't weaken anything
+# that actually matters -- their audit logs stay in separate paths regardless.
+RUN groupadd -r libshare --gid=10004 \
+    && useradd -r -g libshare --uid=10004 --home-dir=/nonexistent --shell=/usr/sbin/nologin libshare \
+    # Same CVE/attack-surface reasoning as sandbox-mcp's images: no
+    # interpreter in the image should exist that this server doesn't need.
+    && dpkg --purge --force-depends --force-remove-essential perl-base \
+    && ! command -v perl
+
+COPY --from=build --chown=root:root --chmod=555 /install /opt/library
+
+ENV PYTHONPATH=/opt/library \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    POLICY_PATH=/policy/parse.yaml \
+    AUDIT_PATH=/audit/audit.jsonl \
+    HOST=0.0.0.0 \
+    PORT=8803
+
+RUN mkdir -p /audit && chown libshare:libshare /audit && chmod 700 /audit
+
+USER libshare
+EXPOSE 8803
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD python3 -c "import socket,os,sys; s=socket.create_connection(('127.0.0.1',int(os.environ['PORT'])),3); s.close()" || exit 1
+
+ENTRYPOINT ["python3", "-m", "library_mcp.servers.parse_server"]

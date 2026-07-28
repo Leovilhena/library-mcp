@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "library-mcp"
+description = "A specialized library-keeper agent: ingest PDF/EPUB books, answer questions grounded in them via local embedding search."
+readme = "README.md"
+requires-python = ">=3.11"
+dynamic = ["version"]
+keywords = ["mcp", "rag", "embeddings", "llm", "agent"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+  "mcp>=1.28.1",
+  "pydantic>=2.13.4",
+  "PyYAML>=6.0.3",
+  "httpx>=0.28.1",
+  "pypdf>=5.1.0",
+  "ebooklib>=0.18",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=9.1.1",
+  "pytest-asyncio>=1.4.0",
+  "ruff>=0.16.0",
+  "mypy>=2.3.0",
+]
+
+[project.scripts]
+library-parse-server = "library_mcp.servers.parse_server:main"
+library-keeper-server = "library_mcp.servers.keeper_server:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "library_mcp.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.mypy]
+python_version = "3.11"
+mypy_path = "src"
+packages = ["library_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q"
