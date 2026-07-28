@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -58,7 +59,46 @@ def _resolve_within(root: Path, file_name: str) -> Path | None:
     return candidate if candidate.is_file() else None
 
 
-def _resolve_source(policy: ParsePolicy, file_name: str) -> Path:
+_DOC_PREFIX_RE = re.compile(r"^doc_[0-9a-f]+_", re.IGNORECASE)
+_SEPARATOR_RE = re.compile(r"[ _,]+")
+
+
+def _normalize_file_name(name: str) -> str:
+    """Strip Hermes' doc_<hash>_ prefix and fold separator/case variants.
+
+    A real, repeated failure mode: given the exact filename in a "[The user
+    sent a document: ...]" message, the model instead reconstructs one from
+    memory of the title -- consistently dropping the doc_<hash>_ prefix and
+    normalizing punctuation (commas vs. underscores, doubled underscores).
+    Verified against three real attempts, 2026-07-28, all missing exactly
+    the prefix. This makes that specific, observed mismatch resolve anyway,
+    deterministically, rather than hoping another prompt tweak sticks --
+    the tool-calling reliability problem this project keeps running into is
+    not something prompting alone has fixed so far.
+    """
+    name = _DOC_PREFIX_RE.sub("", name)
+    return _SEPARATOR_RE.sub("_", name.lower()).strip("_")
+
+
+def _fuzzy_find_within(root: Path, file_name: str) -> Path | None:
+    """Normalized-name match against real files in `root`.
+
+    Only returns a match when exactly one file normalizes to the same name --
+    an ambiguous match is refused rather than guessed, consistent with this
+    project's "don't invent certainty" principle.
+    """
+    target = _normalize_file_name(file_name)
+    if not target or not root.is_dir():
+        return None
+    candidates = [
+        entry
+        for entry in root.iterdir()
+        if entry.is_file() and _normalize_file_name(entry.name) == target
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _resolve_source(policy: ParsePolicy, file_name: str) -> tuple[Path, bool]:
     """Find `file_name` in the inbox, then the Telegram document cache.
 
     Two roots because books arrive two ways: placed directly in the inbox
@@ -66,14 +106,26 @@ def _resolve_source(policy: ParsePolicy, file_name: str) -> Path:
     Hermes saves to its own generic cache -- a real gap found 2026-07-28
     when a sent PDF was invisible to `learn` because only inbox_path was
     mounted. Inbox is tried first since it's the deliberate, curated source.
+
+    Exact matches are tried in both roots before falling back to fuzzy
+    matching in either, so an exact match is never shadowed by a fuzzy one.
+    Returns (path, was_fuzzy) so callers can note when forgiving matching
+    was actually used.
     """
-    found = _resolve_within(policy.inbox_path, file_name)
-    if found is not None:
-        return found
+    roots = [policy.inbox_path]
     if policy.documents_path is not None:
-        found = _resolve_within(policy.documents_path, file_name)
+        roots.append(policy.documents_path)
+
+    for root in roots:
+        found = _resolve_within(root, file_name)
         if found is not None:
-            return found
+            return found, False
+
+    for root in roots:
+        found = _fuzzy_find_within(root, file_name)
+        if found is not None:
+            return found, True
+
     msg = f"'{file_name}' was not found in the inbox or recent documents"
     raise ParseError(msg)
 
@@ -138,10 +190,12 @@ def _hash_bytes(data: bytes) -> str:
 def _learn(deps: _Deps, file_name: str) -> str:
     policy = deps.policy
     try:
-        path = _resolve_source(policy, file_name)
+        path, was_fuzzy = _resolve_source(policy, file_name)
     except ParseError as exc:
         deps.audit.write(Event.INGEST_DENIED, detail=file_name, reason=str(exc))
         return f"Refused: {exc}"
+    if was_fuzzy:
+        deps.audit.write(Event.FUZZY_MATCHED, detail=file_name, resolved_to=path.name)
 
     if path.suffix.lower() not in policy.allowed_extensions:
         deps.audit.write(Event.INGEST_DENIED, detail=file_name, reason="extension not allowed")

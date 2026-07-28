@@ -23,6 +23,7 @@ class Event(StrEnum):
     INGESTED = "ingested"
     INGEST_DENIED = "ingest_denied"
     INGEST_FAILED = "ingest_failed"
+    FUZZY_MATCHED = "fuzzy_matched"
     LISTED = "listed"
     ASKED = "asked"
     SEARCHED = "searched"

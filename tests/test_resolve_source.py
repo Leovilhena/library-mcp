@@ -86,3 +86,59 @@ async def test_learn_refuses_duplicate_file(tmp_path: Path) -> None:
     assert "already have this book" in result
     conn = open_store(deps.policy.db_path)
     assert len(list_books(conn)) == 1
+
+
+async def test_learn_fuzzy_matches_a_dropped_doc_prefix(tmp_path: Path) -> None:
+    # The exact real failure, 2026-07-28: given "[The user sent a document:
+    # ...]" with the real name "doc_60802e8476de__Kozai,_Toyoki_Niu.pdf",
+    # the model instead called learn with a reconstructed-from-memory name
+    # missing the doc_<hash>_ prefix and using different punctuation. Three
+    # separate real attempts all failed this same way before this fix.
+    documents = tmp_path / "documents"
+    documents.mkdir()
+    real_name = "doc_60802e8476de__Kozai,_Toyoki_Niu,_Genhua_Takagaki,_Michiko_Plant_factory.pdf"
+    fixture = Path(__file__).parent / "fixtures" / "networking-with-python.pdf"
+    (documents / real_name).write_bytes(fixture.read_bytes())
+
+    deps = _deps(tmp_path, documents_path=documents)
+    reconstructed_name = "_Kozai___Toyoki_Niu___Genhua_Takagaki_Michiko_Plant_factory.pdf"
+    with patch("library_mcp.servers.parse_server.EmbeddingClient") as mock_client:
+        mock_client.return_value.embed = AsyncMock(return_value=[1.0, 0.0])
+        result = await run_and_wait(_learn, deps, reconstructed_name)
+
+    assert "Started learning" in result
+    conn = open_store(deps.policy.db_path)
+    assert list_books(conn)  # actually resolved and ingested, not refused
+
+
+def test_learn_fuzzy_match_refuses_when_ambiguous(tmp_path: Path) -> None:
+    # Two different real files that would normalize to the same fuzzy key --
+    # must refuse rather than silently guess which one was meant.
+    documents = tmp_path / "documents"
+    documents.mkdir()
+    (documents / "doc_aaa111_Some Book.pdf").write_bytes(b"one")
+    (documents / "doc_bbb222_Some_Book.pdf").write_bytes(b"two")
+
+    deps = _deps(tmp_path, documents_path=documents)
+    result = _learn(deps, "Some_Book.pdf")
+
+    assert "Refused" in result
+
+
+async def test_learn_exact_match_is_never_shadowed_by_a_fuzzy_one(tmp_path: Path) -> None:
+    # If the exact given name exists, it must win even if a differently
+    # named file would also fuzzy-match -- exact intent beats a guess.
+    documents = tmp_path / "documents"
+    documents.mkdir()
+    fixture = Path(__file__).parent / "fixtures" / "networking-with-python.pdf"
+    (documents / "exact-name.pdf").write_bytes(fixture.read_bytes())
+    (documents / "doc_xyz_exact-name.pdf").write_bytes(b"decoy, would also fuzzy-match")
+
+    deps = _deps(tmp_path, documents_path=documents)
+    with patch("library_mcp.servers.parse_server.EmbeddingClient") as mock_client:
+        mock_client.return_value.embed = AsyncMock(return_value=[1.0, 0.0])
+        result = await run_and_wait(_learn, deps, "exact-name.pdf")
+
+    assert "Started learning" in result
+    conn = open_store(deps.policy.db_path)
+    assert list_books(conn)
