@@ -35,6 +35,14 @@ class ParsePolicy(_Strict):
     embed_timeout_seconds: Annotated[float, Field(ge=1.0, le=120.0)] = 30.0
     # Where books to ingest are read from. Read-only mount in practice.
     inbox_path: Path
+    # Optional second source root: Hermes' own Telegram-attachment cache
+    # (~/.pythia/cache/documents), so a PDF/EPUB sent as a chat attachment
+    # can be learned by name without a manual copy step into inbox_path.
+    # Added 2026-07-28 after a real attempt failed silently -- the model
+    # tried to learn a file that existed only here, which library-parse
+    # couldn't see at all. Read-only, same path-escape protection as
+    # inbox_path. None disables it (e.g. in tests).
+    documents_path: Path | None = None
     db_path: Path
     allowed_extensions: list[str] = Field(default_factory=lambda: [".pdf", ".epub"])
     max_file_mb: Annotated[int, Field(ge=1, le=500)] = 100
