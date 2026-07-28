@@ -30,6 +30,8 @@ class Event(StrEnum):
     ANSWERED = "answered"
     ANSWER_FAILED = "answer_failed"
     EMBED_FAILED = "embed_failed"
+    DELETED = "deleted"
+    DELETE_DENIED = "delete_denied"
     ERROR = "error"
 
 

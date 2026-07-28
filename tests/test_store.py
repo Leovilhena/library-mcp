@@ -106,6 +106,52 @@ def test_open_store_migrates_a_pre_dedup_database(tmp_path: Path) -> None:
     with pytest.raises(DuplicateBookError):
         add_book(conn, "Re-upload", "/inbox/new-name.pdf", "2026-07-02", content_hash=expected_hash)
 
+    # doc_type backfill: a book ingested before this feature existed must
+    # not be left unclassified -- "some text"/"more text" is short with no
+    # article markers, so the deterministic classifier calls it "notes".
+    assert statuses[0].doc_type == "notes"
+
+
+def test_open_store_backfills_doc_type_as_book_for_a_real_shaped_book(tmp_path: Path) -> None:
+    # A book-shaped pre-existing row (many chunks, plain prose, no article
+    # markers) must backfill to "book", not "notes" -- this is the shape of
+    # this project's own 11 real already-ingested books.
+    db_path = tmp_path / "old.db"
+    old_conn = sqlite3.connect(db_path)
+    old_conn.executescript(
+        """
+        CREATE TABLE books (
+            id INTEGER PRIMARY KEY,
+            title TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            ingested_at TEXT NOT NULL
+        );
+        CREATE TABLE chunks (
+            id INTEGER PRIMARY KEY,
+            book_id INTEGER NOT NULL REFERENCES books(id),
+            chunk_index INTEGER NOT NULL,
+            section TEXT,
+            text TEXT NOT NULL,
+            embedding TEXT NOT NULL
+        );
+        INSERT INTO books (id, title, source_path, ingested_at)
+        VALUES (1, 'Real Book', '/inbox/real-book.pdf', '2026-07-01');
+        """
+    )
+    long_text = "Chapter body text discussing the subject at length. " * 100
+    for i in range(8):
+        old_conn.execute(
+            "INSERT INTO chunks (book_id, chunk_index, section, text, embedding) VALUES (1, ?, ?, ?, '[1.0]')",
+            (i, f"page {i}", long_text),
+        )
+    old_conn.commit()
+    old_conn.close()
+
+    conn = open_store(db_path)
+
+    statuses = list_book_statuses(conn)
+    assert statuses[0].doc_type == "book"
+
 
 def test_duplicate_content_hash_is_rejected_at_the_db_level(tmp_path: Path) -> None:
     conn = open_store(tmp_path / "test.db")

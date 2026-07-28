@@ -33,6 +33,9 @@ dev = [
   "pytest-asyncio>=1.4.0",
   "ruff>=0.16.0",
   "mypy>=2.3.0",
+  # Only used to generate real PDF fixtures for tests (conftest.py) --
+  # never imported by the shipped package itself.
+  "reportlab>=4.0",
 ]
 
 [project.scripts]

@@ -20,7 +20,14 @@ from mcp.server.fastmcp import FastMCP
 from library_mcp.audit import AuditLog, Event
 from library_mcp.config import ParsePolicy, PolicyError, load_parse_policy, policy_path_from_env
 from library_mcp.embedding import EmbeddingClient, EmbeddingError
-from library_mcp.parser import ParseError, TextBlock, chunk_blocks, extract
+from library_mcp.parser import (
+    ParseError,
+    TextBlock,
+    chunk_blocks,
+    detect_doc_type,
+    extract,
+    extract_title,
+)
 from library_mcp.runtime import audit_from_env, build_app, serve
 from library_mcp.store import (
     DuplicateBookError,
@@ -28,7 +35,9 @@ from library_mcp.store import (
     add_chunk,
     book_count,
     chunk_count,
+    delete_book,
     find_book_by_hash,
+    find_books_by_title_substring,
     list_book_statuses,
     mark_book_status,
     open_store,
@@ -144,6 +153,7 @@ async def _ingest_in_background(deps: _Deps, title: str, source: str, content_ha
     chunks = chunk_blocks(blocks, policy.chunk_chars, policy.chunk_overlap_chars)
     embedder = EmbeddingClient(policy.ollama_base_url, policy.embedding_model, policy.embed_timeout_seconds)
     conn = open_store(policy.db_path)
+    doc_type = detect_doc_type(blocks, Path(source).suffix.lower() or None)
 
     try:
         book_id = add_book(
@@ -154,6 +164,7 @@ async def _ingest_in_background(deps: _Deps, title: str, source: str, content_ha
             content_hash=content_hash,
             status="embedding",
             total_chunks=len(chunks),
+            doc_type=doc_type,
         )
     except DuplicateBookError as exc:
         # Race: another learn() call for the same content finished first,
@@ -219,7 +230,10 @@ def _learn(deps: _Deps, file_name: str) -> str:
         deps.audit.write(Event.INGEST_FAILED, detail=file_name, reason=str(exc))
         return f"Could not learn '{file_name}': {exc}"
 
-    title = path.stem
+    # Real metadata title beats the filename when the file has one -- a
+    # numeric or otherwise meaningless filename (e.g. "1234567.pdf") is
+    # exactly the case this matters for.
+    title = extract_title(path) or path.stem
     asyncio.create_task(_ingest_in_background(deps, title, str(path), content_hash, blocks))
     page_or_section_count = len(blocks)
     return (
@@ -264,6 +278,32 @@ def _learn_text(deps: _Deps, title: str, text: str, source_url: str) -> str:
     return f"Started learning '{title}' in the background."
 
 
+def _forget(deps: _Deps, title: str) -> str:
+    """Remove a learned book/text (and its chunks) by title, or part of one.
+
+    Refuses on zero or multiple matches rather than guessing which book was
+    meant -- deleting the wrong one is unrecoverable, so this is exactly the
+    kind of ambiguity worth refusing back to the caller, same principle as
+    _fuzzy_find_within's exact-match-only-when-unambiguous rule.
+    """
+    title = title.strip()
+    if not title:
+        return "Refused: give at least part of a title to forget."
+    conn = open_store(deps.policy.db_path)
+    matches = find_books_by_title_substring(conn, title)
+    if not matches:
+        deps.audit.write(Event.DELETE_DENIED, detail=title, reason="no match")
+        return f"No learned book matches '{title}'."
+    if len(matches) > 1:
+        deps.audit.write(Event.DELETE_DENIED, detail=title, reason=f"{len(matches)} matches, ambiguous")
+        titles = "\n".join(f"- {t}" for _, t in matches)
+        return f"'{title}' matches more than one book -- be more specific:\n{titles}"
+    book_id, matched_title = matches[0]
+    delete_book(conn, book_id)
+    deps.audit.write(Event.DELETED, detail=matched_title)
+    return f"Forgot '{matched_title}'."
+
+
 def build_server(policy: ParsePolicy, audit: AuditLog) -> FastMCP:
     deps = _Deps(policy=policy, audit=audit)
     app = build_app("library-parse")
@@ -296,6 +336,17 @@ def build_server(policy: ParsePolicy, audit: AuditLog) -> FastMCP:
 
     @app.tool(
         description=(
+            "Remove a learned book/text from the knowledge base by title (or part of one) -- "
+            "deletes it and its chunks permanently, so it will no longer show in list_learned "
+            "or be found by ask_library. Refuses if the given title matches more than one book "
+            "or no book at all, rather than guessing."
+        )
+    )
+    def forget(title: str) -> str:
+        return _forget(deps, title)
+
+    @app.tool(
+        description=(
             "List every book in the knowledge base, including ones still being embedded "
             "in the background, with progress."
         )
@@ -308,12 +359,15 @@ def build_server(policy: ParsePolicy, audit: AuditLog) -> FastMCP:
             return "No books learned yet."
         lines = []
         for b in statuses:
+            doc_type_tag = f"[{b.doc_type}] " if b.doc_type else ""
             if b.status == "embedding":
-                lines.append(f"- {b.title} (embedding: {b.embedded_chunks}/{b.total_chunks} chunks)")
+                lines.append(
+                    f"- {doc_type_tag}{b.title} (embedding: {b.embedded_chunks}/{b.total_chunks} chunks)"
+                )
             elif b.status == "failed":
-                lines.append(f"- {b.title} (failed -- check the audit log)")
+                lines.append(f"- {doc_type_tag}{b.title} (failed -- check the audit log)")
             else:
-                lines.append(f"- {b.title} ({b.embedded_chunks} chunks)")
+                lines.append(f"- {doc_type_tag}{b.title} ({b.embedded_chunks} chunks)")
         return f"{book_count(conn)} book(s), {chunk_count(conn)} chunk(s) total:\n" + "\n".join(lines)
 
     return app

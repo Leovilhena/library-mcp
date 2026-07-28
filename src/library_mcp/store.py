@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS books (
     content_hash TEXT,
     status TEXT NOT NULL DEFAULT 'done',
     total_chunks INTEGER NOT NULL DEFAULT 0,
-    embedded_chunks INTEGER NOT NULL DEFAULT 0
+    embedded_chunks INTEGER NOT NULL DEFAULT 0,
+    doc_type TEXT
 );
 CREATE TABLE IF NOT EXISTS chunks (
     id INTEGER PRIMARY KEY,
@@ -60,6 +61,7 @@ _MIGRATION_COLUMNS = {
     "status": "TEXT NOT NULL DEFAULT 'done'",
     "total_chunks": "INTEGER NOT NULL DEFAULT 0",
     "embedded_chunks": "INTEGER NOT NULL DEFAULT 0",
+    "doc_type": "TEXT",
 }
 
 
@@ -85,12 +87,14 @@ class BookStatus:
     status: str
     total_chunks: int
     embedded_chunks: int
+    doc_type: str | None
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
     existing = {row[1] for row in conn.execute("PRAGMA table_info(books)")}
     added_progress_columns = False
     added_hash_column = False
+    added_doc_type_column = False
     for column, definition in _MIGRATION_COLUMNS.items():
         if column not in existing:
             conn.execute(f"ALTER TABLE books ADD COLUMN {column} {definition}")
@@ -98,6 +102,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 added_progress_columns = True
             if column == "content_hash":
                 added_hash_column = True
+            if column == "doc_type":
+                added_doc_type_column = True
     if added_progress_columns:
         # New columns default to 0, but a book ingested before this feature
         # existed already has real chunks sitting in the chunks table --
@@ -131,6 +137,30 @@ def _migrate(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE books SET content_hash = ? WHERE id = ?", (content_hash, book_id)
             )
+    if added_doc_type_column:
+        # Classify books ingested before this feature existed, same "don't
+        # leave already-ingested data unclassified" requirement as the
+        # content_hash backfill above. Reuses chunks already stored in the
+        # `chunks` table rather than re-reading source files -- those may
+        # not exist any more (learn_text sources are URLs, not files) or may
+        # have moved, and the chunk text is exactly what the classifier
+        # needs anyway.
+        from library_mcp.parser import TextBlock, detect_doc_type
+
+        rows = conn.execute(
+            "SELECT id, source_path FROM books WHERE doc_type IS NULL"
+        ).fetchall()
+        for book_id, source_path in rows:
+            chunk_rows = conn.execute(
+                "SELECT section, text FROM chunks WHERE book_id = ? ORDER BY chunk_index",
+                (book_id,),
+            ).fetchall()
+            blocks = [TextBlock(section=s, text=t) for s, t in chunk_rows]
+            suffix = Path(source_path).suffix.lower() or None
+            doc_type = detect_doc_type(blocks, suffix)
+            conn.execute(
+                "UPDATE books SET doc_type = ? WHERE id = ?", (doc_type, book_id)
+            )
     conn.commit()
 
 
@@ -162,12 +192,14 @@ def add_book(
     content_hash: str | None = None,
     status: str = "done",
     total_chunks: int = 0,
+    doc_type: str | None = None,
 ) -> int:
     try:
         cur = conn.execute(
-            "INSERT INTO books (title, source_path, ingested_at, content_hash, status, total_chunks) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (title, source_path, ingested_at, content_hash, status, total_chunks),
+            "INSERT INTO books "
+            "(title, source_path, ingested_at, content_hash, status, total_chunks, doc_type) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (title, source_path, ingested_at, content_hash, status, total_chunks, doc_type),
         )
     except sqlite3.IntegrityError as exc:
         # A race: two concurrent learn() calls for the same content. The
@@ -193,6 +225,21 @@ def delete_book(conn: sqlite3.Connection, book_id: int) -> None:
     conn.execute("DELETE FROM chunks WHERE book_id = ?", (book_id,))
     conn.execute("DELETE FROM books WHERE id = ?", (book_id,))
     conn.commit()
+
+
+def find_books_by_title_substring(conn: sqlite3.Connection, query: str) -> list[tuple[int, str]]:
+    """Case-insensitive substring match against book titles.
+
+    Returns every match rather than guessing the best one -- an ambiguous
+    query (multiple books matching) should be refused back to the caller
+    to disambiguate, same "don't invent certainty" principle already used
+    for fuzzy filename matching in parse_server.py.
+    """
+    rows = conn.execute(
+        "SELECT id, title FROM books WHERE title LIKE ? ESCAPE '\\' ORDER BY id",
+        (f"%{query.replace('%', r'\%').replace('_', r'\_')}%",),
+    ).fetchall()
+    return [(int(i), t) for i, t in rows]
 
 
 def add_chunk(
@@ -254,6 +301,9 @@ def list_books(conn: sqlite3.Connection) -> list[str]:
 
 def list_book_statuses(conn: sqlite3.Connection) -> list[BookStatus]:
     rows = conn.execute(
-        "SELECT title, status, total_chunks, embedded_chunks FROM books ORDER BY id"
+        "SELECT title, status, total_chunks, embedded_chunks, doc_type FROM books ORDER BY id"
     ).fetchall()
-    return [BookStatus(title=t, status=s, total_chunks=tc, embedded_chunks=ec) for t, s, tc, ec in rows]
+    return [
+        BookStatus(title=t, status=s, total_chunks=tc, embedded_chunks=ec, doc_type=dt)
+        for t, s, tc, ec, dt in rows
+    ]

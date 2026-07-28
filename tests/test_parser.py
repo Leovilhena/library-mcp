@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from library_mcp.parser import ParseError, TextBlock, chunk_blocks, extract
+from library_mcp.parser import ParseError, TextBlock, chunk_blocks, detect_doc_type, extract
 
 _FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -46,3 +46,74 @@ def test_extract_unsupported_extension_raises(tmp_path: Path) -> None:
 
     with pytest.raises(ParseError):
         extract(bogus)
+
+
+def test_extract_title_returns_none_for_reportlab_default() -> None:
+    # A real, verified finding: reportlab's default PDF title is literally
+    # the placeholder string "untitled" when nothing sets it explicitly --
+    # worse than the filename-derived fallback the caller already has.
+    from library_mcp.parser import extract_title
+
+    assert extract_title(_FIXTURES / "networking-with-python.pdf") is None
+
+
+def test_extract_title_returns_real_metadata_title() -> None:
+    from library_mcp.parser import extract_title
+
+    assert extract_title(_FIXTURES / "titled-book.pdf") == "A Real Book Title"
+
+
+def test_extract_title_returns_epub_dc_title() -> None:
+    from library_mcp.parser import extract_title
+
+    assert extract_title(_FIXTURES / "python-fundamentals.epub") == "Python Fundamentals"
+
+
+def test_detect_doc_type_epub_is_always_book() -> None:
+    # No article/notes case ever applies to EPUB -- verified default, not a guess.
+    blocks = [TextBlock(section="c1", text="Abstract\nKeywords: x\nReferences\n10.1234/abcd")]
+    assert detect_doc_type(blocks, ".epub") == "book"
+
+
+def test_detect_doc_type_recognizes_a_scientific_article() -> None:
+    blocks = [
+        TextBlock(
+            section="p1",
+            text=(
+                "Abstract\nThis paper studies X.\nKeywords: networking, latency\n\n"
+                + ("Body text discussing the method in detail. " * 40)
+            ),
+        ),
+        TextBlock(
+            section="p2",
+            text=(
+                ("More body text about results and discussion. " * 40)
+                + "\nReferences\n[1] Smith, J. (2020). doi:10.1234/abcd5678"
+            ),
+        ),
+    ]
+    assert detect_doc_type(blocks, ".pdf") == "article"
+
+
+def test_detect_doc_type_recognizes_short_notes() -> None:
+    blocks = [TextBlock(section=None, text="Buy milk. Call Alice back. Renew car insurance.")]
+    assert detect_doc_type(blocks, ".pdf") == "notes"
+
+
+def test_detect_doc_type_defaults_to_book() -> None:
+    # A long PDF with no article markers and no notes-length text -- the
+    # existing 11 real ingested books are exactly this shape.
+    blocks = [
+        TextBlock(section=f"page {i}", text="Chapter body text. " * 200) for i in range(1, 12)
+    ]
+    assert detect_doc_type(blocks, ".pdf") == "book"
+
+
+def test_detect_doc_type_single_article_signal_is_not_enough() -> None:
+    # Guards against over-eager classification -- a book that happens to
+    # mention "references" once (e.g. a bibliography chapter title) should
+    # not flip to "article" on that alone.
+    blocks = [
+        TextBlock(section=f"page {i}", text="Chapter body text. " * 200) for i in range(1, 8)
+    ] + [TextBlock(section="page 8", text="References\nSee the bibliography chapter.")]
+    assert detect_doc_type(blocks, ".pdf") == "book"

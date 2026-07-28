@@ -38,6 +38,63 @@ def _strip_html(html: str) -> str:
     return text.strip()
 
 
+_PLACEHOLDER_TITLES = {
+    "untitled",
+    "untitled document",
+    "untitled1",
+    "unknown",
+    "document1",
+    "new document",
+}
+
+
+def _clean_title(raw: str | None) -> str | None:
+    """Reject a metadata title that isn't actually useful as one.
+
+    Some PDFs/EPUBs carry a title field that's empty, just whitespace, or a
+    generator's own default placeholder -- verified live: reportlab's
+    default document title is literally the string "untitled" when nothing
+    sets it explicitly, which would be a worse result than the
+    filename-derived fallback the caller already has, not a better one.
+    """
+    if not raw:
+        return None
+    cleaned = raw.strip()
+    if not cleaned or len(cleaned) > 300:
+        return None
+    if cleaned.lower() in _PLACEHOLDER_TITLES:
+        return None
+    return cleaned
+
+
+def extract_title(path: Path) -> str | None:
+    """Best-effort real title from the document's own metadata.
+
+    Falls back silently (returns None) on anything that isn't a clean,
+    present title -- callers already have a filename-derived fallback, and
+    a numeric or otherwise meaningless filename is exactly the case this
+    exists for: `learn`'s title used to be the raw filename verbatim, which
+    is useless when someone uploads a book named e.g. "1234567.pdf".
+    """
+    suffix = path.suffix.lower()
+    try:
+        if suffix == ".pdf":
+            reader = PdfReader(str(path))
+            meta = reader.metadata
+            return _clean_title(getattr(meta, "title", None) if meta else None)
+        if suffix == ".epub":
+            from ebooklib import epub
+
+            book = epub.read_epub(str(path))
+            values = book.get_metadata("DC", "title")
+            if values:
+                return _clean_title(values[0][0])
+            return None
+    except Exception:  # noqa: BLE001 - metadata is a nice-to-have, never worth failing ingestion over
+        return None
+    return None
+
+
 def extract_pdf(path: Path) -> list[TextBlock]:
     try:
         reader = PdfReader(str(path))
@@ -100,6 +157,52 @@ def extract(path: Path) -> list[TextBlock]:
         return extract_epub(path)
     msg = f"unsupported file type: {suffix}"
     raise ParseError(msg)
+
+
+_DOI_RE = re.compile(r"\bdoi\s*[:\-]?\s*10\.\d{4,9}/", re.IGNORECASE)
+_KEYWORDS_RE = re.compile(r"\bkeywords\s*[:\-]", re.IGNORECASE)
+_REFERENCES_RE = re.compile(r"\b(references|bibliography)\b", re.IGNORECASE)
+_NOTES_MAX_BLOCKS = 6
+_NOTES_MAX_CHARS = 4000
+_ARTICLE_MIN_SIGNALS = 2
+
+
+def detect_doc_type(blocks: list[TextBlock], suffix: str | None = None) -> str:
+    """Classify a document as "book", "article", or "notes" -- deterministically.
+
+    No LLM in the loop: this project's default model calls tools/follows
+    structured-output instructions only 40-60% of the time
+    ([[pythia-model-tool-calling]]), so a classification a user might rely
+    on (filtering, search) needs to come from real structural markers, not
+    a guess the model could get wrong or fabricate. EPUB defaults straight
+    to "book" -- ebooklib's format is used here almost exclusively for
+    books, never for the short-notes/scientific-article case.
+    """
+    if suffix == ".epub":
+        return "book"
+    full_text = "\n".join(b.text for b in blocks)
+    total_chars = len(full_text)
+    lower = full_text.lower()
+    head = lower[:2000]
+    tail = lower[-4000:]
+
+    has_abstract = "abstract" in head
+    has_keywords = _KEYWORDS_RE.search(head) is not None
+    has_doi = _DOI_RE.search(lower) is not None
+    has_references = _REFERENCES_RE.search(tail) is not None
+
+    article_signals = sum([has_abstract, has_keywords, has_doi, has_references])
+    if article_signals >= _ARTICLE_MIN_SIGNALS:
+        return "article"
+
+    if (
+        len(blocks) <= _NOTES_MAX_BLOCKS
+        and total_chars < _NOTES_MAX_CHARS
+        and article_signals == 0
+    ):
+        return "notes"
+
+    return "book"
 
 
 @dataclass(frozen=True, slots=True)
