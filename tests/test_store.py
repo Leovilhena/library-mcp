@@ -1,3 +1,4 @@
+import hashlib
 import sqlite3
 from pathlib import Path
 
@@ -153,6 +154,61 @@ def test_open_store_backfills_doc_type_as_book_for_a_real_shaped_book(tmp_path: 
 
     statuses = list_book_statuses(conn)
     assert statuses[0].doc_type == "book"
+
+
+def test_content_hash_backfill_retries_on_a_later_open_when_file_was_missing(tmp_path: Path) -> None:
+    # Real bug caught by review: library-parse and library-keeper are two
+    # separate processes sharing this db with no ordering between them, and
+    # only library-parse's container can read source files. If keeper
+    # happened to be the process that added the content_hash column (this
+    # test simulates that by opening once while the source file is
+    # unreadable), the old code's "only backfill once, in whichever process
+    # added the column" gate meant a later open by a process that COULD read
+    # the file would never get a second chance -- content_hash stayed NULL
+    # forever, silently reintroducing the exact re-upload-sails-past-dedup
+    # bug this backfill exists to prevent.
+    db_path = tmp_path / "old.db"
+    source_file = tmp_path / "old.pdf"
+
+    old_conn = sqlite3.connect(db_path)
+    old_conn.executescript(
+        f"""
+        CREATE TABLE books (
+            id INTEGER PRIMARY KEY,
+            title TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            ingested_at TEXT NOT NULL
+        );
+        CREATE TABLE chunks (
+            id INTEGER PRIMARY KEY,
+            book_id INTEGER NOT NULL REFERENCES books(id),
+            chunk_index INTEGER NOT NULL,
+            section TEXT,
+            text TEXT NOT NULL,
+            embedding TEXT NOT NULL
+        );
+        INSERT INTO books (id, title, source_path, ingested_at)
+        VALUES (1, 'Old Book', '{source_file}', '2026-07-01');
+        """
+    )
+    old_conn.commit()
+    old_conn.close()
+
+    # "library-keeper" opens first -- source file not present/readable from
+    # its container, so the column gets added but content_hash stays NULL.
+    assert not source_file.exists()
+    open_store(db_path)
+    conn = open_store(db_path)
+    row = conn.execute("SELECT content_hash FROM books WHERE id = 1").fetchone()
+    assert row[0] is None
+
+    # "library-parse" opens later, now that the file is actually there --
+    # must still backfill, not just on the call that added the column.
+    source_file.write_bytes(b"real pdf bytes")
+    conn2 = open_store(db_path)
+    row2 = conn2.execute("SELECT content_hash FROM books WHERE id = 1").fetchone()
+    assert row2[0] is not None
+    assert row2[0] == hashlib.sha256(b"real pdf bytes").hexdigest()
 
 
 def test_duplicate_content_hash_is_rejected_at_the_db_level(tmp_path: Path) -> None:

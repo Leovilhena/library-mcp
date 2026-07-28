@@ -68,3 +68,32 @@ def test_forget_refuses_empty_title(tmp_path: Path) -> None:
     deps = _deps(tmp_path)
     result = _forget(deps, "   ")
     assert "Refused" in result
+
+
+async def test_forget_prefers_an_exact_match_over_ambiguous_substring_hits(tmp_path: Path) -> None:
+    # "Python" substring-matches both books, but exactly equals the title of
+    # only one -- that's not actually ambiguous, there's one obvious answer.
+    deps = _deps(tmp_path)
+    await _learn_one(deps, "Python")
+    await _learn_one(deps, "Python Cookbook", text="other content")
+
+    result = _forget(deps, "Python")
+
+    assert "Forgot 'Python'" in result
+    conn = open_store(deps.policy.db_path)
+    assert list_books(conn) == ["Python Cookbook"]
+
+
+async def test_forget_matches_a_title_containing_a_backslash(tmp_path: Path) -> None:
+    # Real bug caught by review: escaping '%'/'_' without first escaping the
+    # backslash meant a literal '\' in the query silently ate the next
+    # escaped character, so a title fragment like a Windows path never
+    # matched at all.
+    deps = _deps(tmp_path)
+    await _learn_one(deps, r"Notes from C:\Users\leo")
+
+    result = _forget(deps, r"C:\Users\leo")
+
+    assert "Forgot" in result
+    conn = open_store(deps.policy.db_path)
+    assert list_books(conn) == []

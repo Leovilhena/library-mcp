@@ -1,0 +1,15 @@
+# library-parse policy. Mounted read-only.
+ollama_base_url: http://172.27.224.1:11434
+embedding_model: nomic-embed-text
+inbox_path: /inbox
+# Hermes' generic Telegram-attachment cache, mounted read-only alongside
+# the dedicated inbox -- added 2026-07-28 after a real PDF sent via
+# Telegram was invisible to learn() because only inbox_path was mounted.
+documents_path: /documents
+db_path: /data/knowledge.db
+allowed_extensions:
+  - .pdf
+  - .epub
+max_file_mb: 100
+chunk_chars: 1200
+chunk_overlap_chars: 150

@@ -85,16 +85,28 @@ async def _ask(deps: _Deps, question: str) -> str:
 
         if isinstance(decision, AnswerDecision):
             deps.audit.write(Event.ANSWERED, detail=question, searches=attempt + 1)
+            if not all_results:
+                # Real bug found by review: `_parse_decision` always returns
+                # AnswerDecision once `remaining_searches` hits 0 (the last
+                # attempt's prompt explicitly tells the model to answer
+                # regardless), so this -- not the loop-exhaustion fallthrough
+                # below -- is the actual reachable path for "we genuinely
+                # have nothing" (the prompt tells the model to say so, which
+                # produces a real AnswerDecision, not a SearchDecision). The
+                # loop can never fall through on its own; only the
+                # duplicate-query break below reaches that code at all.
+                record_knowledge_gap(conn, question, "no_matches", datetime.now(UTC).isoformat())
             return decision.text
         if isinstance(decision, SearchDecision):
             query = decision.query
             continue
 
-    # Exhausted max_searches without an explicit answer -- return whatever
-    # context was gathered rather than silently giving up.
-    deps.audit.write(Event.ANSWER_FAILED, detail=question, reason="max_searches exhausted")
-    reason = "no_matches" if not all_results else "max_searches_exhausted"
-    record_knowledge_gap(conn, question, reason, datetime.now(UTC).isoformat())
+    # Only reachable via the duplicate-query break above -- `_parse_decision`
+    # always returns AnswerDecision on the final iteration (remaining == 0),
+    # so normal loop exhaustion never falls through to here. Label the
+    # reason for what actually happened, not what the code used to assume.
+    deps.audit.write(Event.ANSWER_FAILED, detail=question, reason="repeated query, no answer")
+    record_knowledge_gap(conn, question, "repeated_query_no_answer", datetime.now(UTC).isoformat())
     return (
         "I searched the library but couldn't settle on a confident answer. "
         f"Closest passages found:\n\n{_format_context(all_results, policy.max_context_chars)}"
@@ -128,7 +140,7 @@ def build_server(policy: KeeperPolicy, audit: AuditLog) -> FastMCP:
         conn = open_store(deps.policy.db_path)
         gaps = list_knowledge_gaps_fn(conn)
         if not gaps:
-            return "No open knowledge gaps -- every asked question found a confident answer."
+            return "No open knowledge gaps recorded."
         lines = [
             f"- \"{g.question}\" (asked {g.times_asked}x, last {g.last_asked_at}, reason: {g.reason})"
             for g in gaps

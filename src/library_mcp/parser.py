@@ -159,12 +159,20 @@ def extract(path: Path) -> list[TextBlock]:
     raise ParseError(msg)
 
 
+_ABSTRACT_RE = re.compile(r"\babstract\b", re.IGNORECASE)
 _DOI_RE = re.compile(r"\bdoi\s*[:\-]?\s*10\.\d{4,9}/", re.IGNORECASE)
 _KEYWORDS_RE = re.compile(r"\bkeywords\s*[:\-]", re.IGNORECASE)
 _REFERENCES_RE = re.compile(r"\b(references|bibliography)\b", re.IGNORECASE)
 _NOTES_MAX_BLOCKS = 6
 _NOTES_MAX_CHARS = 4000
 _ARTICLE_MIN_SIGNALS = 2
+# A real scientific article is short -- a document this long is a book
+# (or thesis) even if it has a DOI/references section somewhere in it.
+# Found live: a bibliography containing one DOI, or ending in a
+# "References" section (both completely ordinary in a real book), was
+# enough on its own to misclassify a full-length academic book as an
+# "article" before this ceiling existed.
+_ARTICLE_MAX_CHARS = 150_000
 
 
 def detect_doc_type(blocks: list[TextBlock], suffix: str | None = None) -> str:
@@ -182,13 +190,18 @@ def detect_doc_type(blocks: list[TextBlock], suffix: str | None = None) -> str:
         return "book"
     full_text = "\n".join(b.text for b in blocks)
     total_chars = len(full_text)
+    if total_chars > _ARTICLE_MAX_CHARS:
+        return "book"
     lower = full_text.lower()
     head = lower[:2000]
     tail = lower[-4000:]
 
-    has_abstract = "abstract" in head
+    has_abstract = _ABSTRACT_RE.search(head) is not None
     has_keywords = _KEYWORDS_RE.search(head) is not None
-    has_doi = _DOI_RE.search(lower) is not None
+    # DOI restricted to the head, same reasoning as the length ceiling above:
+    # a real article states its own DOI up front, on page one -- one buried
+    # in a bibliography entry just means the book cites someone else's paper.
+    has_doi = _DOI_RE.search(head) is not None
     has_references = _REFERENCES_RE.search(tail) is not None
 
     article_signals = sum([has_abstract, has_keywords, has_doi, has_references])

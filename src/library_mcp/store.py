@@ -112,75 +112,80 @@ class BookStatus:
 
 def _migrate(conn: sqlite3.Connection) -> None:
     existing = {row[1] for row in conn.execute("PRAGMA table_info(books)")}
-    added_progress_columns = False
-    added_hash_column = False
-    added_doc_type_column = False
     for column, definition in _MIGRATION_COLUMNS.items():
         if column not in existing:
             conn.execute(f"ALTER TABLE books ADD COLUMN {column} {definition}")
-            if column in ("total_chunks", "embedded_chunks"):
-                added_progress_columns = True
-            if column == "content_hash":
-                added_hash_column = True
-            if column == "doc_type":
-                added_doc_type_column = True
-    if added_progress_columns:
-        # New columns default to 0, but a book ingested before this feature
-        # existed already has real chunks sitting in the chunks table --
-        # without this, list_learned would show "(0 chunks)" for every
-        # already-ingested book the moment this migration ran. Found live
-        # 2026-07-28 against this project's own real database.
-        conn.execute(
-            """
-            UPDATE books SET
-                total_chunks = (SELECT COUNT(*) FROM chunks WHERE chunks.book_id = books.id),
-                embedded_chunks = (SELECT COUNT(*) FROM chunks WHERE chunks.book_id = books.id)
-            WHERE total_chunks = 0
-            """
-        )
-    if added_hash_column:
-        # A book ingested before dedup existed has no recorded hash, so a
-        # re-upload of that exact file would sail past the duplicate check
-        # with nothing to compare against -- found live 2026-07-28 re-adding
-        # a book already in this project's own real database. Backfill by
-        # re-reading source_path, when it's still a real file on disk (a
-        # learn_text entry's source is a URL, not a file, and is correctly
-        # left unhashed -- there's nothing to re-read for those).
-        rows = conn.execute(
-            "SELECT id, source_path FROM books WHERE content_hash IS NULL"
-        ).fetchall()
-        for book_id, source_path in rows:
-            path = Path(source_path)
-            if not path.is_file():
-                continue
-            content_hash = hashlib.sha256(path.read_bytes()).hexdigest()
-            conn.execute(
-                "UPDATE books SET content_hash = ? WHERE id = ?", (content_hash, book_id)
-            )
-    if added_doc_type_column:
-        # Classify books ingested before this feature existed, same "don't
-        # leave already-ingested data unclassified" requirement as the
-        # content_hash backfill above. Reuses chunks already stored in the
-        # `chunks` table rather than re-reading source files -- those may
-        # not exist any more (learn_text sources are URLs, not files) or may
-        # have moved, and the chunk text is exactly what the classifier
-        # needs anyway.
-        from library_mcp.parser import TextBlock, detect_doc_type
 
-        rows = conn.execute(
-            "SELECT id, source_path FROM books WHERE doc_type IS NULL"
+    # All three backfills below run unconditionally on every open_store()
+    # call, not gated on "did *this* ALTER TABLE just run" -- deliberately.
+    # library-parse and library-keeper are two separate processes sharing
+    # this one database with no `depends_on` ordering between them, and only
+    # library-parse's container mounts /inbox and /documents. A real,
+    # previously-live bug: if library-keeper happened to be the process that
+    # added `content_hash` (e.g. it opened the db first after a fresh
+    # migration), the backfill ran there instead, found zero readable
+    # source files (keeper has no filesystem mount for them), and the
+    # gate variable being process-local meant it never got a second try
+    # when library-parse (which *can* read the files) opened the db later.
+    # Each backfill's own WHERE clause already makes it a safe no-op when
+    # there's nothing left to do, so unconditional is strictly safer than
+    # "once, in whichever process happened to add the column."
+
+    # New columns default to 0, but a book ingested before this feature
+    # existed already has real chunks sitting in the chunks table --
+    # without this, list_learned would show "(0 chunks)" for every
+    # already-ingested book the moment this migration ran. Found live
+    # 2026-07-28 against this project's own real database.
+    conn.execute(
+        """
+        UPDATE books SET
+            total_chunks = (SELECT COUNT(*) FROM chunks WHERE chunks.book_id = books.id),
+            embedded_chunks = (SELECT COUNT(*) FROM chunks WHERE chunks.book_id = books.id)
+        WHERE total_chunks = 0
+        """
+    )
+
+    # A book ingested before dedup existed has no recorded hash, so a
+    # re-upload of that exact file would sail past the duplicate check
+    # with nothing to compare against -- found live 2026-07-28 re-adding
+    # a book already in this project's own real database. Backfill by
+    # re-reading source_path, when it's still a real file on disk (a
+    # learn_text entry's source is a URL, not a file, and is correctly
+    # left unhashed -- there's nothing to re-read for those).
+    rows = conn.execute(
+        "SELECT id, source_path FROM books WHERE content_hash IS NULL"
+    ).fetchall()
+    for book_id, source_path in rows:
+        path = Path(source_path)
+        if not path.is_file():
+            continue
+        content_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        conn.execute(
+            "UPDATE books SET content_hash = ? WHERE id = ?", (content_hash, book_id)
+        )
+    # Classify books ingested before this feature existed, same "don't
+    # leave already-ingested data unclassified" requirement as the
+    # content_hash backfill above. Reuses chunks already stored in the
+    # `chunks` table rather than re-reading source files -- those may
+    # not exist any more (learn_text sources are URLs, not files) or may
+    # have moved, and the chunk text is exactly what the classifier
+    # needs anyway.
+    from library_mcp.parser import TextBlock, detect_doc_type
+
+    rows = conn.execute(
+        "SELECT id, source_path FROM books WHERE doc_type IS NULL"
+    ).fetchall()
+    for book_id, source_path in rows:
+        chunk_rows = conn.execute(
+            "SELECT section, text FROM chunks WHERE book_id = ? ORDER BY chunk_index",
+            (book_id,),
         ).fetchall()
-        for book_id, source_path in rows:
-            chunk_rows = conn.execute(
-                "SELECT section, text FROM chunks WHERE book_id = ? ORDER BY chunk_index",
-                (book_id,),
-            ).fetchall()
-            blocks = [TextBlock(section=s, text=t) for s, t in chunk_rows]
-            suffix = Path(source_path).suffix.lower() or None
-            doc_type = detect_doc_type(blocks, suffix)
-            conn.execute(
-                "UPDATE books SET doc_type = ? WHERE id = ?", (doc_type, book_id)
-            )
+        blocks = [TextBlock(section=s, text=t) for s, t in chunk_rows]
+        suffix = Path(source_path).suffix.lower() or None
+        doc_type = detect_doc_type(blocks, suffix)
+        conn.execute(
+            "UPDATE books SET doc_type = ? WHERE id = ?", (doc_type, book_id)
+        )
     conn.commit()
 
 
@@ -255,9 +260,15 @@ def find_books_by_title_substring(conn: sqlite3.Connection, query: str) -> list[
     to disambiguate, same "don't invent certainty" principle already used
     for fuzzy filename matching in parse_server.py.
     """
+    # Escape the escape character itself FIRST -- found by review: escaping
+    # '%'/'_' without first escaping '\' means a literal backslash in the
+    # query (e.g. a Windows-style path fragment) gets silently consumed as
+    # part of whatever escape sequence follows it, and the intended
+    # substring never matches.
+    escaped = query.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
     rows = conn.execute(
         "SELECT id, title FROM books WHERE title LIKE ? ESCAPE '\\' ORDER BY id",
-        (f"%{query.replace('%', r'\%').replace('_', r'\_')}%",),
+        (f"%{escaped}%",),
     ).fetchall()
     return [(int(i), t) for i, t in rows]
 
@@ -284,11 +295,15 @@ def commit(conn: sqlite3.Connection) -> None:
 def record_knowledge_gap(conn: sqlite3.Connection, question: str, reason: str, asked_at: str) -> None:
     """Log a question the keeper couldn't answer -- deterministic call sites only.
 
-    Called from exactly two structural, code-driven signals in keeper_server.py
-    (max_searches exhausted with no answer, or zero search matches ever found)
-    -- never from parsing the model's own answer text for phrases like "I
-    don't know", which would depend on wording this stack's own model is only
-    40-60% reliable at producing consistently.
+    Called from two structural, code-driven signals in keeper_server.py's
+    `_ask()` -- an AnswerDecision reached with no search results backing it
+    (the actually-reachable "we have nothing" case: the keeper's own prompt
+    tells the reasoner to answer regardless on its last attempt, so this
+    surfaces as a real answer, not a loop exhausting silently), or the
+    reasoner repeating the same search query twice in a row -- never from
+    parsing the model's own answer text for phrases like "I don't know",
+    which would depend on wording this stack's own model is only 40-60%
+    reliable at producing consistently.
 
     Re-asking the same exact question bumps `times_asked` and refreshes
     `last_asked_at` rather than creating a duplicate row, so a question asked

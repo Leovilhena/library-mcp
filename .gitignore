@@ -7,3 +7,9 @@ __pycache__/
 .ruff_cache/
 tests/fixtures/*.pdf
 tests/fixtures/*.epub
+
+# Real policy files (with a real, deployment-specific Ollama URL etc.) if
+# ever dropped here by mistake -- only the .example.yaml templates are
+# meant to be tracked. Found by review 2026-07-28.
+policy/*.yaml
+!policy/*.example.yaml

@@ -117,3 +117,23 @@ def test_detect_doc_type_single_article_signal_is_not_enough() -> None:
         TextBlock(section=f"page {i}", text="Chapter body text. " * 200) for i in range(1, 8)
     ] + [TextBlock(section="page 8", text="References\nSee the bibliography chapter.")]
     assert detect_doc_type(blocks, ".pdf") == "book"
+
+
+def test_detect_doc_type_a_real_academic_book_is_not_an_article() -> None:
+    # Real bug caught live: a full-length academic book with an ordinary
+    # bibliography (containing a DOI, since that's completely normal citation
+    # practice) and its own "References" section at the end used to hit the
+    # 2-signal threshold (has_doi + has_references) and get misclassified as
+    # "article" -- even though it's hundreds of pages long. The length
+    # ceiling and restricting DOI-search to the head (a real article states
+    # its own DOI up front, not buried in a citation) both fix this.
+    long_body = "Chapter body text discussing the subject at length. " * 3000
+    blocks = [
+        TextBlock(section="front matter", text="A Book About Something\nBy An Author"),
+        TextBlock(section="body", text=long_body),
+        TextBlock(
+            section="back matter",
+            text="References\n[1] Smith, J. (2020). Some Paper. doi:10.1234/abcd5678",
+        ),
+    ]
+    assert detect_doc_type(blocks, ".pdf") == "book"

@@ -295,9 +295,18 @@ def _forget(deps: _Deps, title: str) -> str:
         deps.audit.write(Event.DELETE_DENIED, detail=title, reason="no match")
         return f"No learned book matches '{title}'."
     if len(matches) > 1:
-        deps.audit.write(Event.DELETE_DENIED, detail=title, reason=f"{len(matches)} matches, ambiguous")
-        titles = "\n".join(f"- {t}" for _, t in matches)
-        return f"'{title}' matches more than one book -- be more specific:\n{titles}"
+        # An exact (case-insensitive) title match among several substring
+        # hits isn't actually ambiguous -- e.g. "Python" matching both
+        # "Python" and "Python Cookbook" has one obviously-intended answer.
+        # Without this, the exactly-titled book could never be forgotten at
+        # all once any other book's title happened to contain it.
+        exact = [m for m in matches if m[1].lower() == title.lower()]
+        if len(exact) == 1:
+            matches = exact
+        else:
+            deps.audit.write(Event.DELETE_DENIED, detail=title, reason=f"{len(matches)} matches, ambiguous")
+            titles = "\n".join(f"- {t}" for _, t in matches)
+            return f"'{title}' matches more than one book -- be more specific:\n{titles}"
     book_id, matched_title = matches[0]
     delete_book(conn, book_id)
     deps.audit.write(Event.DELETED, detail=matched_title)

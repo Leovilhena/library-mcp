@@ -5,14 +5,27 @@ books, then answer questions grounded in them via local embedding search.
 
 Two MCP servers, one shared knowledge base:
 
-- **`library-parse`** — `learn(file_name)` extracts, chunks, and embeds a
-  book from a shared inbox directory into `knowledge.db`. `list_learned()`
-  lists what's in there.
-- **`library-keeper`** — `ask_library(question)` embeds the question,
-  searches the shared store, and hands matches to a small local reasoning
-  model that decides whether to answer (with citations) or search again for
-  connected knowledge, bounded at a few attempts. The frontier model calls
-  this once and gets one synthesized answer back.
+- **`library-parse`**:
+  - `learn(file_name)` extracts, chunks, and embeds a book from a shared
+    inbox/attachment-cache directory into `knowledge.db`, classifying it
+    as a book/article/notes deterministically (structural markers, no
+    LLM) and extracting a real title from file metadata when present.
+  - `learn_text(title, text, source_url)` ingests already-extracted text
+    (e.g. a fetched web page), the same way, minus the file-parsing step.
+  - `forget(title)` removes a learned book by title or partial title,
+    refusing on zero or multiple matches rather than guessing.
+  - `list_learned()` lists everything in the store, including in-progress
+    embedding jobs, with each book's doc_type.
+- **`library-keeper`**:
+  - `ask_library(question)` embeds the question, searches the shared
+    store, and hands matches to a small local reasoning model that decides
+    whether to answer (with citations) or search again for connected
+    knowledge, bounded at a few attempts. The frontier model calls this
+    once and gets one synthesized answer back. Deterministically logs a
+    "knowledge gap" (never from parsing the model's own wording) when a
+    question can't be confidently answered.
+  - `list_knowledge_gaps()` lists open gaps — questions worth adding a
+    source for — for human review.
 
 Every embedding/reasoning call goes to one address set in policy at
 startup — never a tool argument, never document content — so there's no
