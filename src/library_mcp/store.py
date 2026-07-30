@@ -86,6 +86,33 @@ CREATE TABLE IF NOT EXISTS pending_followups (
 );
 CREATE INDEX IF NOT EXISTS idx_pending_followups_open
 ON pending_followups(injected_at, expired_at) WHERE injected_at IS NULL AND expired_at IS NULL;
+
+-- Book structuring (docs/planning/book-structuring.md §6/§9 step 0). Same
+-- database, same additive pattern -- no sibling file, same reasoning as
+-- knowledge-gap research's own tables above.
+CREATE TABLE IF NOT EXISTS book_chapters (
+    id INTEGER PRIMARY KEY,
+    book_id INTEGER NOT NULL REFERENCES books(id),
+    chapter_index INTEGER NOT NULL,
+    section TEXT NOT NULL,
+    summary TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    model TEXT,
+    structured_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_book_chapters_book ON book_chapters(book_id);
+
+CREATE TABLE IF NOT EXISTS book_glossary_terms (
+    id INTEGER PRIMARY KEY,
+    book_id INTEGER NOT NULL REFERENCES books(id),
+    chapter_id INTEGER REFERENCES book_chapters(id),
+    term TEXT NOT NULL,
+    definition TEXT NOT NULL,
+    model TEXT,
+    extracted_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_book_glossary_book ON book_glossary_terms(book_id);
+CREATE INDEX IF NOT EXISTS idx_book_glossary_term ON book_glossary_terms(term);
 """
 
 # One partial unique index (content_hash IS NOT NULL) rather than a plain
@@ -187,6 +214,50 @@ class PendingFollowup:
     resolution_kind: str
     summary: str
     resolved_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class BookChapter:
+    """One `book_chapters` row (docs/planning/book-structuring.md §6)."""
+
+    id: int
+    book_id: int
+    chapter_index: int
+    section: str
+    status: str
+    model: str | None
+    structured_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class GlossaryEntry:
+    """One glossary hit, joined with its book title -- what `_ask()`'s
+    term-lookup pre-check (§4, §9 step 4) actually needs, not a raw row."""
+
+    term: str
+    definition: str
+    book_title: str
+    chapter_index: int | None
+    model: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class StructuringCandidate:
+    """One EPUB book selected for a `book_structure.py` run (§9 step 3)."""
+
+    book_id: int
+    title: str
+    source_path: str
+    ingested_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class BookStructuringStatus:
+    """§7's one small addition: a `structured: yes/no/pending` flag per book
+    for an existing `list_learned`-style view, not a new tool."""
+
+    title: str
+    structured: str  # "yes" | "pending" | "no"
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -723,3 +794,200 @@ def expire_stale_followups(
         )
         conn.commit()
     return expired
+
+
+# ---------------------------------------------------------------------------
+# Book structuring (docs/planning/book-structuring.md §6/§9)
+# ---------------------------------------------------------------------------
+
+
+def list_epub_books_needing_structuring(
+    conn: sqlite3.Connection, limit: int
+) -> list[StructuringCandidate]:
+    """Oldest-unstructured-first, EPUB only (§2, §8, §9 step 3).
+
+    "Unstructured" covers two cases, both real and both worth re-selecting:
+    a book with no `book_chapters` rows at all (never attempted), and a book
+    that has rows but at least one is still `status='pending'` (a previous
+    run started it and stopped -- crashed, hit the batch limit mid-book,
+    whatever -- before finishing every chapter). `book_chapters.status`
+    exists specifically so partial progress is visible and resumable (§6's
+    own comment on the column); this query is what makes that real rather
+    than aspirational. A book whose chapters are all `done`/`failed` is
+    fully processed and never resurfaces here.
+    """
+    rows = conn.execute(
+        "SELECT id, title, source_path, ingested_at FROM books "
+        "WHERE source_path LIKE '%.epub' "
+        "AND ("
+        "  id NOT IN (SELECT DISTINCT book_id FROM book_chapters)"
+        "  OR id IN (SELECT DISTINCT book_id FROM book_chapters WHERE status = 'pending')"
+        ") "
+        "ORDER BY ingested_at LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [
+        StructuringCandidate(book_id=int(i), title=t, source_path=sp, ingested_at=ia)
+        for i, t, sp, ia in rows
+    ]
+
+
+def list_sections_for_book(conn: sqlite3.Connection, book_id: int) -> list[tuple[str, str]]:
+    """Reconstruct this book's chapter-shaped blocks straight from `chunks`,
+    without touching the source file again (§9 step 1: "no new parsing
+    code -- the boundary is already implicit in `section`"). Groups chunks
+    by `section`, preserving first-appearance order (== chapter order, since
+    `extract_epub` emits one section per spine item in document order and
+    `chunk_blocks` never reorders), and concatenates each section's chunk
+    texts in `chunk_index` order. `library-keeper` has no filesystem mount
+    for the original EPUB -- only `library-parse` does -- so this is also
+    the only source of chapter text this process can reach.
+    """
+    rows = conn.execute(
+        "SELECT section, text FROM chunks WHERE book_id = ? AND section IS NOT NULL "
+        "ORDER BY chunk_index",
+        (book_id,),
+    ).fetchall()
+    order: list[str] = []
+    parts: dict[str, list[str]] = {}
+    for section, text in rows:
+        if section not in parts:
+            parts[section] = []
+            order.append(section)
+        parts[section].append(text)
+    return [(section, "\n".join(parts[section])) for section in order]
+
+
+def add_chapter(conn: sqlite3.Connection, book_id: int, chapter_index: int, section: str) -> int:
+    cur = conn.execute(
+        "INSERT INTO book_chapters (book_id, chapter_index, section, status) "
+        "VALUES (?, ?, ?, 'pending')",
+        (book_id, chapter_index, section),
+    )
+    conn.commit()
+    return int(cur.lastrowid)  # type: ignore[arg-type]
+
+
+def mark_chapter_status(
+    conn: sqlite3.Connection,
+    chapter_id: int,
+    status: str,
+    model: str | None = None,
+    structured_at: str | None = None,
+) -> None:
+    conn.execute(
+        "UPDATE book_chapters SET status = ?, "
+        "model = COALESCE(?, model), "
+        "structured_at = COALESCE(?, structured_at) "
+        "WHERE id = ?",
+        (status, model, structured_at, chapter_id),
+    )
+    conn.commit()
+
+
+def list_chapters_for_book(conn: sqlite3.Connection, book_id: int) -> list[BookChapter]:
+    rows = conn.execute(
+        "SELECT id, book_id, chapter_index, section, status, model, structured_at "
+        "FROM book_chapters WHERE book_id = ? ORDER BY chapter_index",
+        (book_id,),
+    ).fetchall()
+    return [
+        BookChapter(
+            id=int(i), book_id=int(b), chapter_index=int(ci), section=s,
+            status=status, model=m, structured_at=sa,
+        )
+        for i, b, ci, s, status, m, sa in rows
+    ]
+
+
+def add_glossary_term(
+    conn: sqlite3.Connection,
+    book_id: int,
+    chapter_id: int,
+    term: str,
+    definition: str,
+    model: str,
+    extracted_at: str,
+) -> int:
+    cur = conn.execute(
+        "INSERT INTO book_glossary_terms "
+        "(book_id, chapter_id, term, definition, model, extracted_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (book_id, chapter_id, term, definition, model, extracted_at),
+    )
+    conn.commit()
+    return int(cur.lastrowid)  # type: ignore[arg-type]
+
+
+def lookup_glossary_term(conn: sqlite3.Connection, term: str) -> GlossaryEntry | None:
+    """Deterministic exact-then-substring match against `term` (§6, §9 step
+    4) -- no embedding search, no small-model judgment, same house-rule fit
+    as `find_books_by_title_substring`'s own `LIKE`-based matching. An
+    exact case-insensitive match wins over a substring match so a precise
+    term ("recursion") isn't shadowed by a longer stored term that happens
+    to contain it ("recursion theorem") when both exist.
+    """
+    row = conn.execute(
+        "SELECT book_glossary_terms.term, book_glossary_terms.definition, "
+        "books.title, book_chapters.chapter_index, book_glossary_terms.model "
+        "FROM book_glossary_terms "
+        "JOIN books ON book_glossary_terms.book_id = books.id "
+        "LEFT JOIN book_chapters ON book_glossary_terms.chapter_id = book_chapters.id "
+        "WHERE lower(book_glossary_terms.term) = lower(?) "
+        "ORDER BY book_glossary_terms.extracted_at DESC LIMIT 1",
+        (term,),
+    ).fetchone()
+    if row is None:
+        # Same escape-the-escape-character-first reasoning as
+        # find_books_by_title_substring.
+        escaped = term.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+        row = conn.execute(
+            "SELECT book_glossary_terms.term, book_glossary_terms.definition, "
+            "books.title, book_chapters.chapter_index, book_glossary_terms.model "
+            "FROM book_glossary_terms "
+            "JOIN books ON book_glossary_terms.book_id = books.id "
+            "LEFT JOIN book_chapters ON book_glossary_terms.chapter_id = book_chapters.id "
+            "WHERE book_glossary_terms.term LIKE ? ESCAPE '\\' "
+            "ORDER BY book_glossary_terms.extracted_at DESC LIMIT 1",
+            (f"%{escaped}%",),
+        ).fetchone()
+    if row is None:
+        return None
+    term_, definition, title, chapter_index, model = row
+    return GlossaryEntry(
+        term=term_, definition=definition, book_title=title,
+        chapter_index=int(chapter_index) if chapter_index is not None else None,
+        model=model,
+    )
+
+
+def book_structuring_status(conn: sqlite3.Connection) -> list[BookStructuringStatus]:
+    """One row per book: `"no"` (never queued -- no `book_chapters` rows at
+    all, e.g. a PDF/`learn_text` book, or an EPUB not yet reached in the
+    backlog), `"pending"` (has chapter rows, at least one still not
+    `done`/`failed`), `"yes"` (every chapter row is `done`/`failed` and at
+    least one is `done`). §7's small, independent addition -- a one-column
+    view, not a new tool.
+    """
+    books = conn.execute("SELECT id, title FROM books ORDER BY id").fetchall()
+    statuses = conn.execute(
+        "SELECT book_id, status FROM book_chapters"
+    ).fetchall()
+    by_book: dict[int, list[str]] = {}
+    for book_id, status in statuses:
+        by_book.setdefault(int(book_id), []).append(status)
+
+    result: list[BookStructuringStatus] = []
+    for book_id, title in books:
+        chapter_statuses = by_book.get(int(book_id))
+        if not chapter_statuses:
+            structured = "no"
+        elif any(s == "pending" for s in chapter_statuses):
+            structured = "pending"
+        elif any(s == "done" for s in chapter_statuses):
+            structured = "yes"
+        else:
+            # Every chapter attempted and every one failed.
+            structured = "yes"
+        result.append(BookStructuringStatus(title=title, structured=structured))
+    return result

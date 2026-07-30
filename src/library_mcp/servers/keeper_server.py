@@ -11,6 +11,7 @@ exchange itself.
 from __future__ import annotations
 
 import json
+import re
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -23,14 +24,46 @@ from library_mcp.embedding import EmbeddingClient, EmbeddingError
 from library_mcp.keeper_model import AnswerDecision, ReasoningClient, ReasoningError, SearchDecision
 from library_mcp.runtime import audit_from_env, build_app, serve
 from library_mcp.store import (
+    GlossaryEntry,
     SearchResult,
     list_pending_followups as list_pending_followups_fn,
+    lookup_glossary_term,
     mark_followups_delivered,
     open_store,
     record_knowledge_gap,
     search,
 )
 from library_mcp.store import list_knowledge_gaps as list_knowledge_gaps_fn
+
+# Book structuring (docs/planning/book-structuring.md §4, §9 step 4): a
+# cheap, deterministic pre-check for "does this question look like a
+# term/definition lookup" -- written as a regex, not judged by the small
+# reasoning model, per this stack's house rule (deterministic code over
+# small-model judgment wherever a decision can be made without one). Only
+# matches a short, single-concept phrasing ("what is X", "define X", "what
+# does X mean") -- a longer, multi-clause question that happens to start
+# with "what is" is exactly the case this must NOT fire on, since a wrong
+# glossary hint injected into a broad question's context is more likely to
+# mislead than help.
+_TERM_LOOKUP_RE = re.compile(
+    r"^\s*(?:what\s+(?:is|are)|define|what\s+does)\s+(?:an?\s+|the\s+)?(.+?)"
+    r"(?:\s+mean)?\s*\??\s*$",
+    re.I,
+)
+_TERM_LOOKUP_MAX_WORDS = 6
+
+
+def _term_lookup_candidate(question: str) -> str | None:
+    """Extract a candidate glossary term from `question`, or None if it
+    doesn't look like a term/definition lookup. Deterministic, no model
+    call -- see the module-level comment above `_TERM_LOOKUP_RE`."""
+    match = _TERM_LOOKUP_RE.match(question)
+    if not match:
+        return None
+    candidate = match.group(1).strip().strip("?").strip()
+    if not candidate or len(candidate.split()) > _TERM_LOOKUP_MAX_WORDS:
+        return None
+    return candidate
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,9 +72,26 @@ class _Deps:
     audit: AuditLog
 
 
-def _format_context(results: list[SearchResult], max_chars: int) -> str:
+def _format_context(
+    results: list[SearchResult], max_chars: int, glossary_entry: GlossaryEntry | None = None
+) -> str:
+    """Additive, never a substitute (docs/planning/book-structuring.md §4,
+    §9 step 4): a glossary hit is prepended as its own clearly labeled
+    block, visually and structurally distinct from the `[{book_title} --
+    {section}]` chunk blocks below it, so the reasoning model can never
+    confuse Pythia's own synthesis for verbatim source text. Real chunk
+    search results are always included in the same call, regardless of
+    whether a glossary entry was found -- this function never chooses one
+    or the other."""
     parts = []
     used = 0
+    if glossary_entry is not None:
+        entry = (
+            "[Glossary entry -- Pythia's own synthesis, not verbatim book text -- "
+            f"{glossary_entry.book_title}]\n{glossary_entry.term}: {glossary_entry.definition}\n"
+        )
+        parts.append(entry)
+        used += len(entry)
     for r in results:
         entry = f"[{r.book_title} -- {r.section or 'unknown section'}]\n{r.text}\n"
         if used + len(entry) > max_chars:
@@ -53,9 +103,24 @@ def _format_context(results: list[SearchResult], max_chars: int) -> str:
 
 async def _ask(deps: _Deps, question: str) -> str:
     policy = deps.policy
-    deps.audit.write(Event.ASKED, detail=question)
-
     conn = open_store(policy.db_path)
+
+    # Book structuring's deterministic term-lookup pre-check (§4, §9 step
+    # 4), run once, ahead of the first search round -- never gates or
+    # replaces the real search below, it only adds one extra labeled
+    # context block if it fires. `glossary_hit`/`glossary_term` on the
+    # ASKED event give step 7's "does the pre-check actually fire on real
+    # questions" observation something concrete to check in
+    # keeper-audit/audit.jsonl without a new event type.
+    term_candidate = _term_lookup_candidate(question)
+    glossary_entry = lookup_glossary_term(conn, term_candidate) if term_candidate else None
+    deps.audit.write(
+        Event.ASKED,
+        detail=question,
+        glossary_hit=glossary_entry is not None,
+        glossary_term=glossary_entry.term if glossary_entry else None,
+    )
+
     embedder = EmbeddingClient(
         policy.ollama_base_url, policy.embedding_model, policy.embed_timeout_seconds
     )
@@ -86,7 +151,7 @@ async def _ask(deps: _Deps, question: str) -> str:
         new_text = {r.text for r in results}
         all_results = results + [r for r in all_results if r.text not in new_text]
 
-        context = _format_context(all_results, policy.max_context_chars)
+        context = _format_context(all_results, policy.max_context_chars, glossary_entry)
         remaining = policy.max_searches - attempt - 1
         try:
             decision = await reasoner.decide(query, context, remaining)
@@ -122,7 +187,8 @@ async def _ask(deps: _Deps, question: str) -> str:
     record_knowledge_gap(conn, question, "repeated_query_no_answer", datetime.now(UTC).isoformat())
     return (
         "I searched the library but couldn't settle on a confident answer. "
-        f"Closest passages found:\n\n{_format_context(all_results, policy.max_context_chars)}"
+        "Closest passages found:\n\n"
+        f"{_format_context(all_results, policy.max_context_chars, glossary_entry)}"
     )
 
 

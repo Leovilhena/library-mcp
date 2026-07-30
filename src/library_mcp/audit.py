@@ -49,6 +49,14 @@ class Event(StrEnum):
     FOLLOWUP_INJECTED = "followup_injected"
     FOLLOWUP_EXPIRED = "followup_expired"
 
+    # Book structuring (docs/planning/book-structuring.md §9 step 0). Every
+    # step of the nightly book_structure.py pass writes here, same file,
+    # same "judge by the log" reasoning as the gap-research events above.
+    BOOK_STRUCTURING_STARTED = "book_structuring_started"
+    CHAPTER_STRUCTURED = "chapter_structured"
+    GLOSSARY_EXTRACTED = "glossary_extracted"
+    STRUCTURING_FAILED = "structuring_failed"
+
 
 _MAX_FIELD_CHARS = 2000
 
