@@ -54,6 +54,38 @@ CREATE TABLE IF NOT EXISTS knowledge_gaps (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_gaps_question
 ON knowledge_gaps(question) WHERE resolved = 0;
+
+-- Knowledge-gap research (docs/planning/knowledge-gap-research.md §4/§9
+-- step 0). Same database, new tables -- no sibling file: no hot-path
+-- mtime-watcher reads knowledge.db the way tgproxy reads reflex.db, so the
+-- reason that split exists doesn't transfer here.
+CREATE TABLE IF NOT EXISTS external_research (
+    id INTEGER PRIMARY KEY,
+    gap_id INTEGER NOT NULL REFERENCES knowledge_gaps(id),
+    question TEXT NOT NULL,
+    source TEXT NOT NULL,
+    source_title TEXT,
+    source_url TEXT,
+    extract TEXT,
+    synthesized_answer TEXT,
+    outcome TEXT NOT NULL,
+    researched_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_external_research_gap ON external_research(gap_id);
+
+CREATE TABLE IF NOT EXISTS pending_followups (
+    id INTEGER PRIMARY KEY,
+    gap_id INTEGER NOT NULL REFERENCES knowledge_gaps(id),
+    chat_id TEXT NOT NULL,
+    question TEXT NOT NULL,
+    resolution_kind TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    resolved_at TEXT NOT NULL,
+    injected_at TEXT,
+    expired_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pending_followups_open
+ON pending_followups(injected_at, expired_at) WHERE injected_at IS NULL AND expired_at IS NULL;
 """
 
 # One partial unique index (content_hash IS NOT NULL) rather than a plain
@@ -75,6 +107,15 @@ _MIGRATION_COLUMNS = {
     "total_chunks": "INTEGER NOT NULL DEFAULT 0",
     "embedded_chunks": "INTEGER NOT NULL DEFAULT 0",
     "doc_type": "TEXT",
+}
+
+# Knowledge-gap research (docs/planning/knowledge-gap-research.md §4/§7):
+# two additive columns on the pre-existing `knowledge_gaps` table, same
+# migration pattern as `_MIGRATION_COLUMNS` above, applied to a different
+# table so kept separate rather than merged into one dict keyed by table.
+_KNOWLEDGE_GAPS_MIGRATION_COLUMNS = {
+    "external_attempt_count": "INTEGER NOT NULL DEFAULT 0",
+    "giving_up": "INTEGER NOT NULL DEFAULT 0",
 }
 
 
@@ -112,11 +153,52 @@ class BookStatus:
     doc_type: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class OpenGap:
+    """One `knowledge_gaps` row, id included -- unlike `KnowledgeGap` above,
+    which is Leo's own read-only `list_knowledge_gaps` view and deliberately
+    doesn't expose the internal id. The nightly gap-research job (§9 step 6)
+    needs the id to write `external_research`/`pending_followups` rows
+    against it."""
+
+    id: int
+    question: str
+    reason: str
+    times_asked: int
+    external_attempt_count: int
+    giving_up: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalResearchRow:
+    id: int
+    gap_id: int
+    source: str
+    outcome: str
+    researched_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class PendingFollowup:
+    id: int
+    gap_id: int
+    chat_id: str
+    question: str
+    resolution_kind: str
+    summary: str
+    resolved_at: str
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     existing = {row[1] for row in conn.execute("PRAGMA table_info(books)")}
     for column, definition in _MIGRATION_COLUMNS.items():
         if column not in existing:
             conn.execute(f"ALTER TABLE books ADD COLUMN {column} {definition}")
+
+    existing_gap_columns = {row[1] for row in conn.execute("PRAGMA table_info(knowledge_gaps)")}
+    for column, definition in _KNOWLEDGE_GAPS_MIGRATION_COLUMNS.items():
+        if column not in existing_gap_columns:
+            conn.execute(f"ALTER TABLE knowledge_gaps ADD COLUMN {column} {definition}")
 
     # All three backfills below run unconditionally on every open_store()
     # call, not gated on "did *this* ALTER TABLE just run" -- deliberately.
@@ -381,3 +463,208 @@ def list_book_statuses(conn: sqlite3.Connection) -> list[BookStatus]:
         BookStatus(title=t, status=s, total_chunks=tc, embedded_chunks=ec, doc_type=dt)
         for t, s, tc, ec, dt in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# Knowledge-gap research (docs/planning/knowledge-gap-research.md)
+# ---------------------------------------------------------------------------
+
+
+def list_open_gaps(conn: sqlite3.Connection) -> list[OpenGap]:
+    """Every unresolved gap, id included -- the nightly job's triage input
+    (§9 step 6). Ordered oldest-asked-first so a gap sitting open the
+    longest gets researched first when a run has to stop partway."""
+    rows = conn.execute(
+        "SELECT id, question, reason, times_asked, external_attempt_count, giving_up "
+        "FROM knowledge_gaps WHERE resolved = 0 ORDER BY first_asked_at"
+    ).fetchall()
+    return [
+        OpenGap(
+            id=int(i),
+            question=q,
+            reason=r,
+            times_asked=int(ta),
+            external_attempt_count=int(eac),
+            giving_up=bool(gu),
+        )
+        for i, q, r, ta, eac, gu in rows
+    ]
+
+
+def mark_gap_resolved(conn: sqlite3.Connection, gap_id: int) -> None:
+    conn.execute("UPDATE knowledge_gaps SET resolved = 1 WHERE id = ?", (gap_id,))
+    conn.commit()
+
+
+def increment_external_attempt_count(conn: sqlite3.Connection, gap_id: int) -> int:
+    """Bump the retry-cap counter and return the new value.
+
+    Only called on a `content_miss` outcome (§3.3/§7) -- `infra_down`
+    attempts never reach here, which is the whole point of the split: an
+    outage says nothing about whether the content exists and must never
+    spend down the same budget a genuine "no" spends.
+    """
+    conn.execute(
+        "UPDATE knowledge_gaps SET external_attempt_count = external_attempt_count + 1 "
+        "WHERE id = ?",
+        (gap_id,),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT external_attempt_count FROM knowledge_gaps WHERE id = ?", (gap_id,)
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def set_giving_up(conn: sqlite3.Connection, gap_id: int) -> None:
+    """The hard retry cap (§7.1) tripped: external research stops
+    permanently for this gap. Book-deepen keeps retrying regardless --
+    `giving_up` only gates the external-research half of the pipeline."""
+    conn.execute("UPDATE knowledge_gaps SET giving_up = 1 WHERE id = ?", (gap_id,))
+    conn.commit()
+
+
+def record_external_research(
+    conn: sqlite3.Connection,
+    gap_id: int,
+    question: str,
+    source: str,
+    outcome: str,
+    researched_at: str,
+    source_title: str | None = None,
+    source_url: str | None = None,
+    extract: str | None = None,
+    synthesized_answer: str | None = None,
+) -> int:
+    """Append one external-source attempt, whatever its outcome (§4/§7) --
+    even an `infra_down` attempt is written, so the attempt itself is on
+    record and auditable, it just doesn't count toward the retry cap."""
+    cur = conn.execute(
+        "INSERT INTO external_research "
+        "(gap_id, question, source, source_title, source_url, extract, "
+        "synthesized_answer, outcome, researched_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            gap_id,
+            question,
+            source,
+            source_title,
+            source_url,
+            extract,
+            synthesized_answer,
+            outcome,
+            researched_at,
+        ),
+    )
+    conn.commit()
+    return int(cur.lastrowid)  # type: ignore[arg-type]
+
+
+def latest_external_research(
+    conn: sqlite3.Connection, gap_id: int, source: str
+) -> ExternalResearchRow | None:
+    """Most recent attempt for this gap/source pair -- backs the 7-day
+    content-miss cooldown (§7.1): the caller checks `outcome`/`researched_at`
+    on the result to decide whether to skip this run."""
+    row = conn.execute(
+        "SELECT id, gap_id, source, outcome, researched_at FROM external_research "
+        "WHERE gap_id = ? AND source = ? ORDER BY researched_at DESC LIMIT 1",
+        (gap_id, source),
+    ).fetchone()
+    if row is None:
+        return None
+    i, g, s, o, ra = row
+    return ExternalResearchRow(id=int(i), gap_id=int(g), source=s, outcome=o, researched_at=ra)
+
+
+def create_pending_followup(
+    conn: sqlite3.Connection,
+    gap_id: int,
+    chat_id: str,
+    question: str,
+    resolution_kind: str,
+    summary: str,
+    resolved_at: str,
+) -> int:
+    cur = conn.execute(
+        "INSERT INTO pending_followups "
+        "(gap_id, chat_id, question, resolution_kind, summary, resolved_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (gap_id, chat_id, question, resolution_kind, summary, resolved_at),
+    )
+    conn.commit()
+    return int(cur.lastrowid)  # type: ignore[arg-type]
+
+
+def list_pending_followups(
+    conn: sqlite3.Connection, chat_id: str, limit: int = 2
+) -> list[PendingFollowup]:
+    """Resolved-but-not-yet-surfaced followups for one chat (§5.1) --
+    plain, deterministic SELECT, the only thing that decides what gets
+    handed to a live turn. `chat_id` isn't really filtered on in today's
+    single-user deployment in spirit, but the column and the WHERE clause
+    are real now so adding real multi-chat filtering later is additive."""
+    rows = conn.execute(
+        "SELECT id, gap_id, chat_id, question, resolution_kind, summary, resolved_at "
+        "FROM pending_followups "
+        "WHERE chat_id = ? AND injected_at IS NULL AND expired_at IS NULL "
+        "ORDER BY resolved_at LIMIT ?",
+        (chat_id, limit),
+    ).fetchall()
+    return [
+        PendingFollowup(
+            id=int(i), gap_id=int(g), chat_id=c, question=q, resolution_kind=rk,
+            summary=s, resolved_at=ra,
+        )
+        for i, g, c, q, rk, s, ra in rows
+    ]
+
+
+def mark_followups_delivered(
+    conn: sqlite3.Connection, followup_ids: list[int], injected_at: str
+) -> list[int]:
+    """Set `injected_at` for each id that's still pending. Idempotent: an
+    already-delivered or already-expired id is left untouched and simply
+    isn't returned, matching the MCP tool's documented no-op-on-repeat
+    contract (§5.1)."""
+    delivered: list[int] = []
+    for followup_id in followup_ids:
+        cur = conn.execute(
+            "UPDATE pending_followups SET injected_at = ? "
+            "WHERE id = ? AND injected_at IS NULL AND expired_at IS NULL",
+            (injected_at, followup_id),
+        )
+        if cur.rowcount:
+            delivered.append(followup_id)
+    conn.commit()
+    return delivered
+
+
+def expire_stale_followups(
+    conn: sqlite3.Connection, now: str, cutoff: str
+) -> list[PendingFollowup]:
+    """21-day staleness sweep (§5.3): any never-surfaced followup resolved
+    before `cutoff` gets `expired_at` set. Returns the rows expired so the
+    caller can write one `followup_expired` audit event per row. Expiry only
+    affects the proactive-aside channel -- the underlying `knowledge_gaps`
+    row stays resolved and `external_research` stays on record."""
+    rows = conn.execute(
+        "SELECT id, gap_id, chat_id, question, resolution_kind, summary, resolved_at "
+        "FROM pending_followups "
+        "WHERE injected_at IS NULL AND expired_at IS NULL AND resolved_at < ?",
+        (cutoff,),
+    ).fetchall()
+    expired = [
+        PendingFollowup(
+            id=int(i), gap_id=int(g), chat_id=c, question=q, resolution_kind=rk,
+            summary=s, resolved_at=ra,
+        )
+        for i, g, c, q, rk, s, ra in rows
+    ]
+    if expired:
+        conn.executemany(
+            "UPDATE pending_followups SET expired_at = ? WHERE id = ?",
+            [(now, f.id) for f in expired],
+        )
+        conn.commit()
+    return expired

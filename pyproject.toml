@@ -114,3 +114,6 @@ exclude_dirs = ["tests"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = "-q"
+markers = [
+    "network: hits a real external API (Wikipedia/Wikiquote) -- safe, free, no key, but requires internet access; skip with -m 'not network' offline.",
+]

@@ -10,6 +10,7 @@ exchange itself.
 
 from __future__ import annotations
 
+import json
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -21,7 +22,14 @@ from library_mcp.config import KeeperPolicy, PolicyError, load_keeper_policy, po
 from library_mcp.embedding import EmbeddingClient, EmbeddingError
 from library_mcp.keeper_model import AnswerDecision, ReasoningClient, ReasoningError, SearchDecision
 from library_mcp.runtime import audit_from_env, build_app, serve
-from library_mcp.store import SearchResult, open_store, record_knowledge_gap, search
+from library_mcp.store import (
+    SearchResult,
+    list_pending_followups as list_pending_followups_fn,
+    mark_followups_delivered,
+    open_store,
+    record_knowledge_gap,
+    search,
+)
 from library_mcp.store import list_knowledge_gaps as list_knowledge_gaps_fn
 
 
@@ -156,6 +164,79 @@ def build_server(policy: KeeperPolicy, audit: AuditLog) -> FastMCP:
             for g in gaps
         ]
         return f"{len(gaps)} open knowledge gap(s):\n" + "\n".join(lines)
+
+    # Knowledge-gap research (docs/planning/knowledge-gap-research.md §5.1,
+    # §9 step 7): two internal delivery-bookkeeping tools for the
+    # `knowledge_followup` gateway plugin's `pre_llm_call` hook. Both are
+    # excluded from `mcp_servers.library_keeper.tools` in config.yaml so the
+    # frontier model never sees them as callable -- the decision of what
+    # gets surfaced and when has to stay fully deterministic (§0's house
+    # rule), never left to the 40-60%-reliable frontier model's own
+    # tool-calling judgment. The plugin reaches them via its own direct MCP
+    # client session against this same server, not through the model's
+    # tool-calling machinery (§5.1).
+
+    @app.tool(
+        description=(
+            "Internal delivery-bookkeeping tool for the knowledge_followup "
+            "gateway plugin's pre_llm_call hook (docs/planning/"
+            "knowledge-gap-research.md §5) -- lists resolved-but-not-yet-"
+            "mentioned followups (a deeper book re-search or an external "
+            "lookup has since answered a question that previously failed). "
+            "NOT intended for the frontier model to call on its own initiative "
+            "-- excluded from mcp_servers.library_keeper.tools in config.yaml "
+            "for exactly that reason (see below). Use list_knowledge_gaps "
+            "instead for reviewing what remains genuinely open."
+        )
+    )
+    def list_pending_followups(chat_id: str, limit: int = 2) -> str:
+        conn = open_store(deps.policy.db_path)
+        rows = list_pending_followups_fn(conn, chat_id, limit)
+        if not rows:
+            return "[]"
+        return json.dumps(
+            [
+                {
+                    "id": r.id,
+                    "gap_id": r.gap_id,
+                    "question": r.question,
+                    "resolution_kind": r.resolution_kind,
+                    "summary": r.summary,
+                    "resolved_at": r.resolved_at,
+                }
+                for r in rows
+            ],
+            ensure_ascii=False,
+        )
+
+    @app.tool(
+        description=(
+            "Internal: mark one or more pending followups as delivered -- "
+            "handed to the model to mention in a live turn, see "
+            "docs/planning/knowledge-gap-research.md §5.2 for what 'delivered' "
+            "does and doesn't verify. Idempotent: marking an already-delivered "
+            "id again is a no-op. Same non-model-facing exclusion as "
+            "list_pending_followups."
+        )
+    )
+    def mark_followup_delivered(followup_ids: list[int]) -> str:
+        conn = open_store(deps.policy.db_path)
+        injected_at = datetime.now(UTC).isoformat()
+        delivered = mark_followups_delivered(conn, followup_ids, injected_at)
+        if delivered:
+            rows = conn.execute(
+                "SELECT id, gap_id, chat_id FROM pending_followups WHERE id IN "
+                f"({','.join('?' * len(delivered))})",
+                delivered,
+            ).fetchall()
+            for followup_id, gap_id, chat_id in rows:
+                deps.audit.write(
+                    Event.FOLLOWUP_INJECTED,
+                    gap_id=int(gap_id),
+                    followup_id=int(followup_id),
+                    chat_id=chat_id,
+                )
+        return json.dumps({"delivered": delivered}, ensure_ascii=False)
 
     return app
 

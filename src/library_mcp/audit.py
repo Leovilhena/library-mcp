@@ -34,6 +34,21 @@ class Event(StrEnum):
     DELETE_DENIED = "delete_denied"
     ERROR = "error"
 
+    # Knowledge-gap research (docs/planning/knowledge-gap-research.md §8.2).
+    # Every step of the nightly gap-research pipeline writes here, appended
+    # to this same file rather than a sibling log -- see §8.1 for why.
+    GAP_RESEARCH_STARTED = "gap_research_started"
+    BOOK_DEEPEN_ATTEMPTED = "book_deepen_attempted"
+    BOOK_DEEPEN_RESOLVED = "book_deepen_resolved"
+    BOOK_DEEPEN_NO_ANSWER = "book_deepen_no_answer"
+    EXTERNAL_SOURCE_HEALTH_CHECK = "external_source_health_check"
+    EXTERNAL_SOURCE_ATTEMPTED = "external_source_attempted"
+    EXTERNAL_SOURCE_PERSISTENTLY_DOWN = "external_source_persistently_down"
+    GAP_PERMANENTLY_STUCK = "gap_permanently_stuck"
+    FOLLOWUP_PENDING = "followup_pending"
+    FOLLOWUP_INJECTED = "followup_injected"
+    FOLLOWUP_EXPIRED = "followup_expired"
+
 
 _MAX_FIELD_CHARS = 2000
 
