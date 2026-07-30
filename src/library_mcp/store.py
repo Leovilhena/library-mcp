@@ -352,6 +352,42 @@ def find_book_by_hash(conn: sqlite3.Connection, content_hash: str) -> str | None
     return row[0] if row else None
 
 
+@dataclass(frozen=True, slots=True)
+class BookLookup:
+    """One book match for `find_book_by_filename` -- title/source_path/status,
+    everything the sandbox-redirect plugin (docs/incidents/2026-07-30
+    -sandbox-vs-ask-library.md) needs to decide whether a shell command's
+    file argument already has a done, fully-searchable `ask_library` path."""
+
+    title: str
+    source_path: str
+    status: str
+
+
+def find_book_by_filename(conn: sqlite3.Connection, filename: str) -> BookLookup | None:
+    """Match a bare filename or a path fragment against `books.source_path`
+    by basename, regardless of the directory prefix the caller's copy of
+    the path uses -- library-parse stores paths as `/documents/<name>` in
+    its own container's mount namespace, but a shell command elsewhere (e.g.
+    sandbox-exec, which has no mount into the library at all) may reference
+    the same file under a different or entirely fictitious prefix. Basename
+    matching is the only thing both sides can agree on.
+
+    `filename` may itself be a full path or just a bare name -- only its
+    own basename is used for the comparison. Case-insensitive: filenames
+    with mixed-case originals (e.g. from a Telegram upload) shouldn't need
+    an exact-case shell argument to match. Returns the first match if
+    duplicates somehow exist (source_path is not unique in the schema)."""
+    needle = Path(filename).name.strip().lower()
+    if not needle:
+        return None
+    rows = conn.execute("SELECT title, source_path, status FROM books").fetchall()
+    for title, source_path, status in rows:
+        if Path(source_path).name.strip().lower() == needle:
+            return BookLookup(title=title, source_path=source_path, status=status)
+    return None
+
+
 def add_book(
     conn: sqlite3.Connection,
     title: str,

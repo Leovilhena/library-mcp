@@ -49,6 +49,16 @@ class Event(StrEnum):
     FOLLOWUP_INJECTED = "followup_injected"
     FOLLOWUP_EXPIRED = "followup_expired"
 
+    # Sandbox-vs-ask_library redirect (docs/incidents/2026-07-30-sandbox
+    # -vs-ask-library.md): the gateway's `sandbox_redirect` plugin's
+    # `pre_tool_call` hook calls the model-invisible `find_book_by_filename`
+    # tool to check whether a shell command references an already-ingested,
+    # `done`-status book before letting a manual file read run. Written here
+    # (not a new gateway-side log) so the lookup itself is auditable the same
+    # way every other library-keeper read is, regardless of whether the
+    # plugin goes on to actually block the call.
+    FILENAME_LOOKED_UP = "filename_looked_up"
+
     # Book structuring (docs/planning/book-structuring.md §9 step 0). Every
     # step of the nightly book_structure.py pass writes here, same file,
     # same "judge by the log" reasoning as the gap-research events above.

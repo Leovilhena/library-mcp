@@ -9,6 +9,7 @@ from library_mcp.store import (
     add_book,
     add_chunk,
     commit,
+    find_book_by_filename,
     find_book_by_hash,
     list_book_statuses,
     list_knowledge_gaps,
@@ -304,6 +305,58 @@ def test_find_book_by_hash(tmp_path: Path) -> None:
 
     assert find_book_by_hash(conn, "deadbeef") == "Title"
     assert find_book_by_hash(conn, "nonexistent") is None
+
+
+def test_find_book_by_filename_matches_on_basename_regardless_of_prefix(tmp_path: Path) -> None:
+    # docs/incidents/2026-07-30-sandbox-vs-ask-library.md: the caller's copy
+    # of a path (e.g. a shell command argument) may use a different -- or
+    # entirely fictitious -- directory prefix than library-parse's own
+    # `/documents/<name>` mount. Only the basename can be relied on to match.
+    conn = open_store(tmp_path / "test.db")
+    add_book(
+        conn,
+        "Awakening the Heroes Within",
+        "/documents/doc_8d70205d2619_Carol_S_Pearson_Awakening_the_Heroes_Within.epub",
+        "2026-07-28",
+        status="done",
+    )
+
+    match = find_book_by_filename(
+        conn, "/opt/data/cache/documents/doc_8d70205d2619_Carol_S_Pearson_Awakening_the_Heroes_Within.epub"
+    )
+
+    assert match is not None
+    assert match.title == "Awakening the Heroes Within"
+    assert match.status == "done"
+
+
+def test_find_book_by_filename_is_case_insensitive_and_accepts_bare_names(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "test.db")
+    add_book(conn, "Title", "/documents/Some_Book.PDF", "2026-01-01", status="done")
+
+    assert find_book_by_filename(conn, "some_book.pdf") is not None
+    assert find_book_by_filename(conn, "SOME_BOOK.PDF") is not None
+
+
+def test_find_book_by_filename_no_match_returns_none(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "test.db")
+    add_book(conn, "Title", "/documents/a.pdf", "2026-01-01", status="done")
+
+    assert find_book_by_filename(conn, "unrelated.pdf") is None
+    assert find_book_by_filename(conn, "") is None
+
+
+def test_find_book_by_filename_reflects_non_done_status(tmp_path: Path) -> None:
+    # A match on a still-embedding book must NOT look interchangeable with a
+    # done one -- the caller (sandbox_redirect plugin) only blocks/redirects
+    # on status == "done", so the status has to travel through accurately.
+    conn = open_store(tmp_path / "test.db")
+    add_book(conn, "Title", "/documents/still_embedding.epub", "2026-01-01", status="embedding")
+
+    match = find_book_by_filename(conn, "still_embedding.epub")
+
+    assert match is not None
+    assert match.status == "embedding"
 
 
 def test_progress_and_status_tracking(tmp_path: Path) -> None:

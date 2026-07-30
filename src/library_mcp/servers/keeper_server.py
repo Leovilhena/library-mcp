@@ -26,6 +26,7 @@ from library_mcp.runtime import audit_from_env, build_app, serve
 from library_mcp.store import (
     GlossaryEntry,
     SearchResult,
+    find_book_by_filename,
     list_pending_followups as list_pending_followups_fn,
     lookup_glossary_term,
     mark_followups_delivered,
@@ -272,6 +273,49 @@ def build_server(policy: KeeperPolicy, audit: AuditLog) -> FastMCP:
                 }
                 for r in rows
             ],
+            ensure_ascii=False,
+        )
+
+    # Sandbox-vs-ask_library redirect (docs/incidents/2026-07-30-sandbox
+    # -vs-ask-library.md, docs/architecture/sandbox-mcp.md): a small,
+    # read-only, model-invisible lookup for the gateway's `sandbox_redirect`
+    # plugin's `pre_tool_call` hook. Excluded from
+    # `mcp_servers.library_keeper.tools` in config.yaml for the same reason
+    # `list_pending_followups`/`mark_followup_delivered` are -- this is a
+    # deterministic gateway-side check, never something the frontier model
+    # should be able to call on its own initiative.
+
+    @app.tool(
+        name="find_book_by_filename",
+        description=(
+            "Internal: look up a book by filename (basename match against "
+            "books.source_path, case-insensitive). Used by the gateway's "
+            "sandbox_redirect plugin to check whether a shell command's file "
+            "argument already refers to a fully-ingested, done-status book "
+            "before letting a manual file read run. NOT intended for the "
+            "frontier model to call on its own initiative -- excluded from "
+            "mcp_servers.library_keeper.tools in config.yaml for exactly "
+            "that reason. Use ask_library for actually answering questions."
+        )
+    )
+    def find_book_by_filename_tool(filename: str) -> str:
+        conn = open_store(deps.policy.db_path)
+        match = find_book_by_filename(conn, filename)
+        deps.audit.write(
+            Event.FILENAME_LOOKED_UP,
+            detail=filename,
+            found=match is not None,
+            status=match.status if match else None,
+        )
+        if match is None:
+            return json.dumps({"found": False}, ensure_ascii=False)
+        return json.dumps(
+            {
+                "found": True,
+                "title": match.title,
+                "source_path": match.source_path,
+                "status": match.status,
+            },
             ensure_ascii=False,
         )
 
