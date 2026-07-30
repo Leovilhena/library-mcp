@@ -1,4 +1,5 @@
 import hashlib
+import inspect
 import sqlite3
 from pathlib import Path
 
@@ -115,6 +116,43 @@ def test_search_neighbor_expansion_does_not_duplicate_an_already_matched_chunk(
 
     assert len(results) == 2
     assert sorted(r.text for r in results) == ["first", "second"]
+
+
+def test_search_streams_via_fetchmany_not_fetchall(tmp_path: Path) -> None:
+    # BUG-7, 2026-07-30: search() used to fetchall() every chunk's embedding
+    # before scoring -- fine at small scale, but a real 56,042-chunk library
+    # made the raw embedding JSON alone ~852MB, OOM-killing library-keeper's
+    # 512MB container on a real live query. sqlite3.Connection/Cursor are
+    # immutable C types (verified: monkeypatching either raises
+    # "attribute is read-only" at both the instance and class level), so
+    # this can't assert the fix by counting real fetchmany() calls at
+    # runtime -- it asserts the fix's actual mechanism via source inspection
+    # instead: search()'s body must call fetchmany (bounded batches) and
+    # must NOT call fetchall() on the main chunk-scan cursor. A regression
+    # back to `.fetchall()` would pass every correctness test in this file
+    # (see the sibling test below for those) while reintroducing the OOM --
+    # this test exists specifically to catch that regression shape.
+    source = inspect.getsource(search)
+    assert "fetchmany" in source, "search() must page through chunks via cursor.fetchmany"
+    assert ".fetchall()" not in source, (
+        "search() must not fetchall() the chunk scan -- that's the exact "
+        "regression (BUG-7) this test guards against"
+    )
+
+
+def test_search_correct_over_more_rows_than_one_batch(tmp_path: Path) -> None:
+    # Companion to the source-inspection guard above: confirms the batched
+    # scan still produces correct top-k results across a dataset larger
+    # than a single internal batch, not just that batching syntax is present.
+    conn = open_store(tmp_path / "test.db")
+    book = add_book(conn, "Big Book", "/inbox/big.pdf", "2026-01-01")
+    for i in range(1200):  # several times the batch size, one book is enough
+        add_chunk(conn, book, i, "sec", f"chunk {i}", [1.0 if i == 0 else 0.0, 0.0])
+    commit(conn)
+
+    results = search(conn, [1.0, 0.0], top_k=3)
+
+    assert results[0].text == "chunk 0"
 
 
 def test_open_store_migrates_a_pre_dedup_database(tmp_path: Path) -> None:

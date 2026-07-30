@@ -14,6 +14,7 @@ already needed for PDF/EPUB parsing.
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import math
 import sqlite3
@@ -562,19 +563,49 @@ def search(
     by character budget (`_format_context`'s `max_context_chars`), not by
     list length, so this doesn't reopen the prompt-budget problem raised
     elsewhere in this stack's docs.
+
+    Real incident, 2026-07-30 (BUG-7): this used to `fetchall()` every
+    chunk's embedding into Python memory before scoring, then sort the
+    whole thing. Fine at small scale; at 56,042 real chunks the raw
+    embedding JSON text alone was ~852MB, well past `library-keeper`'s
+    memory limit -- OOM-killed three times in a row on a real live query,
+    confirmed via `dmesg`. Fixed by streaming the cursor in bounded
+    batches and keeping only a `top_k`-sized min-heap of scores in memory
+    at any point, rather than materializing every row at once. Peak memory
+    is now O(batch_size + top_k), not O(total_chunks) -- this scales with
+    library size again instead of degrading every time a new book is
+    learned.
     """
-    rows = conn.execute(
+    cursor = conn.execute(
         "SELECT chunks.id, chunks.book_id, chunks.chunk_index, chunks.section, "
         "chunks.text, chunks.embedding, books.title "
         "FROM chunks JOIN books ON chunks.book_id = books.id"
-    ).fetchall()
-    scored: list[tuple[float, int, int, int, str | None, str, str]] = []
-    for chunk_id, book_id, chunk_index, section, text, embedding_json, title in rows:
-        embedding = json.loads(embedding_json)
-        score = _cosine(query_embedding, embedding)
-        scored.append((score, chunk_id, book_id, chunk_index, section, text, title))
-    scored.sort(key=lambda r: r[0], reverse=True)
-    top = scored[:top_k]
+    )
+    # A plain min-heap keyed on score alone would break the moment two rows
+    # tie exactly (heapq falls through to comparing the rest of the tuple,
+    # and `str`/`None` section values aren't always orderable against each
+    # other) -- the monotonically increasing `counter` is a cheap, always-
+    # comparable tiebreaker that keeps heap ordering well-defined without
+    # ever touching row content for comparison.
+    heap: list[tuple[float, int, tuple[int, int, int, str | None, str, str]]] = []
+    counter = 0
+    _SEARCH_BATCH_SIZE = 500
+    while True:
+        batch = cursor.fetchmany(_SEARCH_BATCH_SIZE)
+        if not batch:
+            break
+        for chunk_id, book_id, chunk_index, section, text, embedding_json, title in batch:
+            embedding = json.loads(embedding_json)
+            score = _cosine(query_embedding, embedding)
+            row_data = (chunk_id, book_id, chunk_index, section, text, title)
+            if len(heap) < top_k:
+                heapq.heappush(heap, (score, counter, row_data))
+            elif top_k > 0 and score > heap[0][0]:
+                heapq.heapreplace(heap, (score, counter, row_data))
+            counter += 1
+    top = [
+        (score, *row_data) for score, _counter, row_data in sorted(heap, reverse=True)
+    ]
 
     seen_chunk_ids = {chunk_id for _, chunk_id, *_ in top}
     results = [
