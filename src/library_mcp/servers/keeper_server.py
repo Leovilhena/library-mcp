@@ -125,9 +125,14 @@ def build_server(policy: KeeperPolicy, audit: AuditLog) -> FastMCP:
     @app.tool(
         description=(
             "Ask a question grounded in the books that have been learned via the learn tool. "
-            "Searches the shared knowledge base (possibly more than once, for connected topics "
-            "across books) and returns one synthesized, cited answer. Use this instead of "
-            "answering from your own memory when the question is about specific book content."
+            "Internally searches the shared knowledge base up to its own configured limit "
+            "(possibly more than once, for connected topics across books) BEFORE returning, "
+            "and returns one synthesized, cited answer -- broadening the search yourself by "
+            "calling this tool again with a rephrased question is redundant and just doubles "
+            "latency and failure exposure for no extra coverage. Call it once per question; "
+            "only call it again in the same turn if the user asked about a genuinely different "
+            "topic. Use this instead of answering from your own memory when the question is "
+            "about specific book content."
         )
     )
     async def ask_library(question: str) -> str:
