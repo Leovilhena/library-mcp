@@ -51,6 +51,71 @@ def test_search_excludes_irrelevant_chunks_when_top_k_is_tight(tmp_path: Path) -
     assert results[0].text == "relevant"
 
 
+def test_search_pulls_in_same_section_neighbors_of_a_match(tmp_path: Path) -> None:
+    # docs/TODO.md BUG-1: a real ~50-item list spanning several consecutive
+    # chunk_index rows in one section, where a generic query only scores one
+    # of them highly enough to rank in the raw top-k.
+    conn = open_store(tmp_path / "test.db")
+    book = add_book(conn, "Values Book", "/inbox/v.pdf", "2026-01-01")
+    add_chunk(conn, book, 0, "ch1", "intro material, not the list", [0.0, 1.0])
+    add_chunk(conn, book, 1, "values", "Acceptance, Adventure, Assertiveness", [1.0, 0.0])
+    add_chunk(conn, book, 2, "values", "Courage, Curiosity, Compassion", [0.5, 0.5])
+    add_chunk(conn, book, 3, "values", "Fairness, Freedom, Friendliness", [0.4, 0.6])
+    add_chunk(conn, book, 4, "closing", "epilogue, not the list", [0.0, 1.0])
+    commit(conn)
+
+    # Only chunk 1 scores highly against this query; top_k=1 alone would
+    # only return it and miss the rest of the same continuous list.
+    results = search(conn, [1.0, 0.0], top_k=1)
+
+    texts = {r.text for r in results}
+    assert "Acceptance, Adventure, Assertiveness" in texts
+    assert "Courage, Curiosity, Compassion" in texts, (
+        "same-section neighbor (chunk_index 2) was not pulled in"
+    )
+    assert "Fairness, Freedom, Friendliness" not in texts, (
+        "chunk_index 3 is not an immediate neighbor of the chunk_index 1 "
+        "match and should not be pulled in by one hop"
+    )
+    assert "intro material, not the list" not in texts, (
+        "chunk_index 0 is an immediate neighbor by index but was never a "
+        "match, so it should not appear on its own"
+    )
+
+
+def test_search_neighbor_expansion_never_crosses_a_section_boundary(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "test.db")
+    book = add_book(conn, "Book", "/inbox/b.pdf", "2026-01-01")
+    add_chunk(conn, book, 0, "chapter1", "end of chapter one", [1.0, 0.0])
+    add_chunk(conn, book, 1, "chapter2", "start of chapter two", [0.0, 1.0])
+    commit(conn)
+
+    results = search(conn, [1.0, 0.0], top_k=1)
+
+    texts = {r.text for r in results}
+    assert texts == {"end of chapter one"}, (
+        "adjacent chunk_index in a DIFFERENT section is a real chapter "
+        "boundary, not a continuous passage, and must not be pulled in"
+    )
+
+
+def test_search_neighbor_expansion_does_not_duplicate_an_already_matched_chunk(
+    tmp_path: Path,
+) -> None:
+    conn = open_store(tmp_path / "test.db")
+    book = add_book(conn, "Book", "/inbox/b.pdf", "2026-01-01")
+    add_chunk(conn, book, 0, "sec", "first", [1.0, 0.0])
+    add_chunk(conn, book, 1, "sec", "second", [0.9, 0.1])
+    commit(conn)
+
+    # top_k=2 already includes both chunks directly -- neighbor expansion
+    # of either one must not produce a duplicate entry for the other.
+    results = search(conn, [1.0, 0.0], top_k=2)
+
+    assert len(results) == 2
+    assert sorted(r.text for r in results) == ["first", "second"]
+
+
 def test_open_store_migrates_a_pre_dedup_database(tmp_path: Path) -> None:
     # Simulates this project's own real database on 2026-07-28: created by
     # an older schema version with no content_hash/status/progress columns,

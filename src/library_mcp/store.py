@@ -427,17 +427,72 @@ def _cosine(a: list[float], b: list[float]) -> float:
 def search(
     conn: sqlite3.Connection, query_embedding: list[float], top_k: int
 ) -> list[SearchResult]:
+    """Top-k semantic search, plus each match's immediate same-section
+    neighbors (docs/TODO.md BUG-1, root-caused 2026-07-29).
+
+    Books are chunked by fixed size, not content boundary, so a single
+    continuous passage (e.g. a ~50-item list spanning ~3 pages) can land
+    across several consecutive `chunk_index` rows in one `section`. A bare
+    top-k semantic match doesn't score all of them equally against a
+    generic query ("list the values"), so a real answer came back with 2 of
+    ~50 items -- confirmed directly against a live book (`chunk_index`
+    221-225, one section, only 1-2 chunks surfacing per query). Pulling in
+    `chunk_index - 1`/`chunk_index + 1` from the same book *and* the same
+    section (never crossing a section boundary -- an adjacent index in a
+    different chapter is not the same continuous passage) closes that gap
+    without needing to guess a better query or raise `top_k` blindly.
+
+    Neighbors are ADDITIVE, not counted against `top_k` -- the top-k
+    ranking itself is unchanged, this only fills in the surrounding context
+    once a passage has already been judged relevant. The result list can
+    therefore be longer than `top_k`; callers already bound total context
+    by character budget (`_format_context`'s `max_context_chars`), not by
+    list length, so this doesn't reopen the prompt-budget problem raised
+    elsewhere in this stack's docs.
+    """
     rows = conn.execute(
-        "SELECT chunks.section, chunks.text, chunks.embedding, books.title "
+        "SELECT chunks.id, chunks.book_id, chunks.chunk_index, chunks.section, "
+        "chunks.text, chunks.embedding, books.title "
         "FROM chunks JOIN books ON chunks.book_id = books.id"
     ).fetchall()
-    scored: list[SearchResult] = []
-    for section, text, embedding_json, title in rows:
+    scored: list[tuple[float, int, int, int, str | None, str, str]] = []
+    for chunk_id, book_id, chunk_index, section, text, embedding_json, title in rows:
         embedding = json.loads(embedding_json)
         score = _cosine(query_embedding, embedding)
-        scored.append(SearchResult(book_title=title, section=section, text=text, score=score))
-    scored.sort(key=lambda r: r.score, reverse=True)
-    return scored[:top_k]
+        scored.append((score, chunk_id, book_id, chunk_index, section, text, title))
+    scored.sort(key=lambda r: r[0], reverse=True)
+    top = scored[:top_k]
+
+    seen_chunk_ids = {chunk_id for _, chunk_id, *_ in top}
+    results = [
+        SearchResult(book_title=title, section=section, text=text, score=score)
+        for score, _chunk_id, _book_id, _chunk_index, section, text, title in top
+    ]
+
+    for score, _chunk_id, book_id, chunk_index, section, _text, title in top:
+        for neighbor_index in (chunk_index - 1, chunk_index + 1):
+            neighbor = conn.execute(
+                "SELECT id, section, text FROM chunks "
+                "WHERE book_id = ? AND chunk_index = ?",
+                (book_id, neighbor_index),
+            ).fetchone()
+            if neighbor is None:
+                continue
+            neighbor_id, neighbor_section, neighbor_text = neighbor
+            if neighbor_id in seen_chunk_ids:
+                continue
+            if neighbor_section != section:
+                # Adjacent chunk_index but a different section -- the fixed-
+                # size chunker crossed a real content boundary here, so this
+                # is not part of the same continuous passage.
+                continue
+            seen_chunk_ids.add(neighbor_id)
+            results.append(
+                SearchResult(
+                    book_title=title, section=neighbor_section, text=neighbor_text, score=score
+                )
+            )
+    return results
 
 
 def book_count(conn: sqlite3.Connection) -> int:
