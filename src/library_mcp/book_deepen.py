@@ -18,6 +18,7 @@ the opposite trade `KeeperPolicy`'s defaults make for the interactive tool.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -79,7 +80,17 @@ async def deepen(
     "AnswerDecision with zero backing results = no real answer" signal
     (§0), but this function never writes to `knowledge_gaps` itself; the
     caller (nightly orchestration, §9 step 6) owns resolution bookkeeping.
+
+    Timing instrumentation (docs/planning/book-qa-escalation-flow.md §0,
+    §7 step 0): wall-clock cost is measured, not guessed, per phase
+    (embed/search/reason) on every attempt plus a total-per-gap figure,
+    logged as extra fields on the existing `BOOK_DEEPEN_ATTEMPTED`/
+    `BOOK_DEEPEN_RESOLVED`/`BOOK_DEEPEN_NO_ANSWER` events rather than a new
+    event type -- this data directly informs whether an on-demand Stage 3
+    trigger (§4.4 of the design doc) is even plausible, and none of it
+    existed anywhere in this codebase before this build.
     """
+    gap_start = time.monotonic()
     audit.write(
         Event.BOOK_DEEPEN_ATTEMPTED, gap_id=gap_id, top_k=config.top_k, model=config.reasoning_model
     )
@@ -95,26 +106,49 @@ async def deepen(
     all_results: list[SearchResult] = []
     seen_queries: set[str] = set()
     answer: str | None = None
+    attempt_timings: list[dict[str, float]] = []
 
     for attempt in range(config.max_searches):
         if query in seen_queries:
             break
         seen_queries.add(query)
+        embed_start = time.monotonic()
         try:
             query_vector = await embedder.embed(query)
         except EmbeddingError:
             break
+        embed_seconds = time.monotonic() - embed_start
 
+        search_start = time.monotonic()
         results = search(conn, query_vector, config.top_k)
+        search_seconds = time.monotonic() - search_start
         new_text = {r.text for r in results}
         all_results = results + [r for r in all_results if r.text not in new_text]
 
         context = _format_context(all_results, config.max_context_chars)
         remaining = config.max_searches - attempt - 1
+        reason_start = time.monotonic()
         try:
             decision = await reasoner.decide(query, context, remaining)
         except ReasoningError:
+            attempt_timings.append(
+                {
+                    "attempt": attempt,
+                    "embed_seconds": round(embed_seconds, 3),
+                    "search_seconds": round(search_seconds, 3),
+                    "reason_seconds": round(time.monotonic() - reason_start, 3),
+                }
+            )
             break
+        reason_seconds = time.monotonic() - reason_start
+        attempt_timings.append(
+            {
+                "attempt": attempt,
+                "embed_seconds": round(embed_seconds, 3),
+                "search_seconds": round(search_seconds, 3),
+                "reason_seconds": round(reason_seconds, 3),
+            }
+        )
 
         if isinstance(decision, AnswerDecision):
             if all_results:
@@ -124,11 +158,23 @@ async def deepen(
             query = decision.query
             continue
 
+    total_seconds = round(time.monotonic() - gap_start, 3)
+
     if answer is not None:
-        audit.write(Event.BOOK_DEEPEN_RESOLVED, gap_id=gap_id)
+        audit.write(
+            Event.BOOK_DEEPEN_RESOLVED,
+            gap_id=gap_id,
+            total_seconds=total_seconds,
+            attempts=attempt_timings,
+        )
         return answer
 
-    audit.write(Event.BOOK_DEEPEN_NO_ANSWER, gap_id=gap_id)
+    audit.write(
+        Event.BOOK_DEEPEN_NO_ANSWER,
+        gap_id=gap_id,
+        total_seconds=total_seconds,
+        attempts=attempt_timings,
+    )
     return None
 
 

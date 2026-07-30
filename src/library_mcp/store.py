@@ -473,7 +473,7 @@ def commit(conn: sqlite3.Connection) -> None:
 
 def record_knowledge_gap(
     conn: sqlite3.Connection, question: str, reason: str, asked_at: str
-) -> None:
+) -> int:
     """Log a question the keeper couldn't answer -- deterministic call sites only.
 
     Called from two structural, code-driven signals in keeper_server.py's
@@ -489,6 +489,10 @@ def record_knowledge_gap(
     Re-asking the same exact question bumps `times_asked` and refreshes
     `last_asked_at` rather than creating a duplicate row, so a question asked
     by three different people shows up once, with a real repeat count.
+
+    Returns the row's `id` (docs/planning/book-qa-escalation-flow.md §2/§4.3):
+    `keeper_server.py`'s `AskOutcome.gap_id` needs the id of the row just
+    written or bumped this call, without a second query to re-derive it.
     """
     existing = conn.execute(
         "SELECT id, times_asked FROM knowledge_gaps WHERE question = ? AND resolved = 0",
@@ -501,13 +505,15 @@ def record_knowledge_gap(
             (asked_at, times_asked + 1, gap_id),
         )
     else:
-        conn.execute(
+        cursor = conn.execute(
             "INSERT INTO knowledge_gaps "
             "(question, reason, first_asked_at, last_asked_at, times_asked) "
             "VALUES (?, ?, ?, ?, 1)",
             (question, reason, asked_at, asked_at),
         )
+        gap_id = cursor.lastrowid
     conn.commit()
+    return gap_id
 
 
 def list_knowledge_gaps(conn: sqlite3.Connection) -> list[KnowledgeGap]:

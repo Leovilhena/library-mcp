@@ -15,6 +15,7 @@ import re
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Literal
 
 from mcp.server.fastmcp import FastMCP
 
@@ -52,6 +53,51 @@ _TERM_LOOKUP_RE = re.compile(
     re.I,
 )
 _TERM_LOOKUP_MAX_WORDS = 6
+
+# Book Q&A escalation flow (docs/planning/book-qa-escalation-flow.md §1):
+# deterministic query cleanup, run first inside `_ask()`, before anything
+# else touches `question`. Named, not guessed, same discipline
+# `_TERM_LOOKUP_RE` above already models -- each entry below is a known,
+# fixed string with a known origin, not a fuzzy "looks like noise" guess.
+#
+# Currently just quiet mode's directive block
+# (`~/.pythia/plugins/quiet_mode/__init__.py`'s `_DIRECTIVE` constant,
+# matched here verbatim): when quiet mode is on, this exact text is
+# prepended to the user's raw message before the frontier model ever sees
+# it, which means it can reach `ask_library`'s `question` argument
+# unparaphrased if the model paraphrases lazily or its tool-argument
+# construction (itself only 40-60% reliable) leaks it through verbatim.
+# Add any future plugin-injected prefix to this same list as it's
+# discovered -- do not guess at one speculatively.
+_WRAPPER_PREFIXES: tuple[str, ...] = (
+    "[Quiet mode is ON. Answer only the message below, as briefly as "
+    "possible. Do not ask a follow-up question. Do not bring up earlier "
+    "topics or add commentary beyond what was asked.]",
+)
+
+# Deterministic-only per the design doc's §1.1 decision: no LLM-based
+# rewrite. Whitespace/newline collapse plus a small set of leading/trailing
+# quote and punctuation artifacts to trim -- never touches the words of the
+# actual question, only wrapper text and formatting noise around it.
+_WHITESPACE_RE = re.compile(r"\s+")
+_QUOTE_STRIP_CHARS = "\"'“”‘’`"
+
+
+def _clean_question(question: str) -> str:
+    """Deterministic Stage-1 cleanup (§1 of the design doc): strip known
+    wrapper-text prefixes, collapse whitespace/newlines to single spaces,
+    trim surrounding quote/punctuation artifacts. No model call -- cannot
+    make a query *worse*, since it only removes text that is never part of
+    the user's real question. Called as the very first line of `_ask()`,
+    before `_term_lookup_candidate()` and before the first embed call, so
+    the cleanup applies to the exact string that drives retrieval."""
+    cleaned = question
+    for prefix in _WRAPPER_PREFIXES:
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix) :]
+    cleaned = _WHITESPACE_RE.sub(" ", cleaned).strip()
+    cleaned = cleaned.strip(_QUOTE_STRIP_CHARS).strip()
+    return cleaned
 
 
 def _term_lookup_candidate(question: str) -> str | None:
@@ -102,9 +148,35 @@ def _format_context(
     return "\n".join(parts) if parts else "(no matching passages found)"
 
 
-async def _ask(deps: _Deps, question: str) -> str:
+@dataclass(frozen=True, slots=True)
+class AskOutcome:
+    """Book Q&A escalation flow (docs/planning/book-qa-escalation-flow.md
+    §2): `_ask_structured()`'s return value, giving a caller inside this
+    same process a machine-readable read on what `_ask()`'s bounded
+    embed->search->reason loop actually did, without changing anything
+    about `ask_library`'s own `question: str -> str` tool contract (only
+    the thin `_ask()` wrapper is exposed to the MCP tool boundary).
+
+    `status` is the existing branches in `_ask()`'s loop, given names --
+    not new decision logic. No "answered but low confidence" status: the
+    codebase has no existing signal for that today and this design does not
+    invent one (§3, §7 non-goals)."""
+
+    text: str
+    status: Literal[
+        "answered", "no_matches", "repeated_query_no_answer", "embed_failed", "reasoning_failed"
+    ]
+    gap_id: int | None  # set iff record_knowledge_gap was called this invocation
+
+
+async def _ask_structured(deps: _Deps, question: str) -> AskOutcome:
     policy = deps.policy
     conn = open_store(policy.db_path)
+
+    # Stage 1 (§1): deterministic query cleanup, first thing, before the
+    # term-lookup pre-check and before the first embed call -- see
+    # `_clean_question`'s own docstring for why this exact spot.
+    cleaned_question = _clean_question(question)
 
     # Book structuring's deterministic term-lookup pre-check (§4, §9 step
     # 4), run once, ahead of the first search round -- never gates or
@@ -113,11 +185,12 @@ async def _ask(deps: _Deps, question: str) -> str:
     # ASKED event give step 7's "does the pre-check actually fire on real
     # questions" observation something concrete to check in
     # keeper-audit/audit.jsonl without a new event type.
-    term_candidate = _term_lookup_candidate(question)
+    term_candidate = _term_lookup_candidate(cleaned_question)
     glossary_entry = lookup_glossary_term(conn, term_candidate) if term_candidate else None
     deps.audit.write(
         Event.ASKED,
         detail=question,
+        cleaned_query=cleaned_question,
         glossary_hit=glossary_entry is not None,
         glossary_term=glossary_entry.term if glossary_entry else None,
     )
@@ -129,7 +202,7 @@ async def _ask(deps: _Deps, question: str) -> str:
         policy.ollama_base_url, policy.reasoning_model, policy.reasoning_timeout_seconds
     )
 
-    query = question
+    query = cleaned_question
     all_results: list[SearchResult] = []
     seen_queries: set[str] = set()
 
@@ -143,7 +216,11 @@ async def _ask(deps: _Deps, question: str) -> str:
             query_vector = await embedder.embed(query)
         except EmbeddingError as exc:
             deps.audit.write(Event.ANSWER_FAILED, detail=question, reason=f"embed failed: {exc}")
-            return "I couldn't search the library right now (embedding call failed)."
+            return AskOutcome(
+                text="I couldn't search the library right now (embedding call failed).",
+                status="embed_failed",
+                gap_id=None,
+            )
 
         results = search(conn, query_vector, policy.top_k)
         deps.audit.write(Event.SEARCHED, detail=query, matches=len(results))
@@ -160,7 +237,11 @@ async def _ask(deps: _Deps, question: str) -> str:
             deps.audit.write(
                 Event.ANSWER_FAILED, detail=question, reason=f"reasoning failed: {exc}"
             )
-            return "I couldn't reason over the retrieved passages right now."
+            return AskOutcome(
+                text="I couldn't reason over the retrieved passages right now.",
+                status="reasoning_failed",
+                gap_id=None,
+            )
 
         if isinstance(decision, AnswerDecision):
             deps.audit.write(Event.ANSWERED, detail=question, searches=attempt + 1)
@@ -174,8 +255,11 @@ async def _ask(deps: _Deps, question: str) -> str:
                 # produces a real AnswerDecision, not a SearchDecision). The
                 # loop can never fall through on its own; only the
                 # duplicate-query break below reaches that code at all.
-                record_knowledge_gap(conn, question, "no_matches", datetime.now(UTC).isoformat())
-            return decision.text
+                gap_id = record_knowledge_gap(
+                    conn, cleaned_question, "no_matches", datetime.now(UTC).isoformat()
+                )
+                return AskOutcome(text=decision.text, status="no_matches", gap_id=gap_id)
+            return AskOutcome(text=decision.text, status="answered", gap_id=None)
         if isinstance(decision, SearchDecision):
             query = decision.query
             continue
@@ -185,12 +269,55 @@ async def _ask(deps: _Deps, question: str) -> str:
     # so normal loop exhaustion never falls through to here. Label the
     # reason for what actually happened, not what the code used to assume.
     deps.audit.write(Event.ANSWER_FAILED, detail=question, reason="repeated query, no answer")
-    record_knowledge_gap(conn, question, "repeated_query_no_answer", datetime.now(UTC).isoformat())
-    return (
+    gap_id = record_knowledge_gap(
+        conn, cleaned_question, "repeated_query_no_answer", datetime.now(UTC).isoformat()
+    )
+    fallback_text = (
         "I searched the library but couldn't settle on a confident answer. "
         "Closest passages found:\n\n"
         f"{_format_context(all_results, policy.max_context_chars, glossary_entry)}"
     )
+    return AskOutcome(text=fallback_text, status="repeated_query_no_answer", gap_id=gap_id)
+
+
+# Book Q&A escalation flow (docs/planning/book-qa-escalation-flow.md §4.2):
+# honest interim-reply wording for the two "the library genuinely didn't
+# settle on an answer" outcomes, in place of `_ask_structured()`'s bare
+# fallback text -- adapted from the design doc's own example wordings, one
+# per branch, so the live turn's only two possible outcomes are a real
+# grounded answer or this kind of honest interim reply. Never used for
+# `embed_failed`/`reasoning_failed` (§3): those are infra failures, not
+# knowledge gaps, and using this framing there would incorrectly imply "the
+# books don't have this" when the real story is "Ollama hiccuped."
+_NO_MATCHES_INTERIM_REPLY = (
+    "I don't have a confident answer on that from the book right now -- let "
+    "me dig deeper and I'll bring it up next time we talk."
+)
+_REPEATED_QUERY_INTERIM_REPLY = (
+    "The library didn't turn up a solid answer to that one on a normal "
+    "search. I'm going to do a wider re-search in the background; if it "
+    "finds something I'll mention it later."
+)
+
+
+async def _ask(deps: _Deps, question: str) -> str:
+    """Thin wrapper preserving `ask_library`'s `question: str -> str` MCP
+    contract exactly (§2, §5): the frontier model still just gets an
+    answer string back. Applies the Stage 2->3 escalation trigger (§3-4):
+    an honest interim reply for the two structurally-detected "no real
+    answer" outcomes, and the outcome's own text unchanged for everything
+    else (a real answer, or an infra failure that must not be reframed as
+    a knowledge gap). Stage 3 itself is not triggered here -- the escalated
+    gap is already a normal `knowledge_gaps` row via `_ask_structured()`'s
+    unchanged `record_knowledge_gap` call, picked up by the existing
+    nightly `gap_research.py` path with zero new code (§7 build plan, step
+    6 onward is explicitly out of scope for this build)."""
+    outcome = await _ask_structured(deps, question)
+    if outcome.status == "no_matches":
+        return _NO_MATCHES_INTERIM_REPLY
+    if outcome.status == "repeated_query_no_answer":
+        return _REPEATED_QUERY_INTERIM_REPLY
+    return outcome.text
 
 
 def build_server(policy: KeeperPolicy, audit: AuditLog) -> FastMCP:
