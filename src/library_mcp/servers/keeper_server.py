@@ -203,11 +203,14 @@ def build_server(policy: KeeperPolicy, audit: AuditLog) -> FastMCP:
             "Internally searches the shared knowledge base up to its own configured limit "
             "(possibly more than once, for connected topics across books) BEFORE returning, "
             "and returns one synthesized, cited answer -- broadening the search yourself by "
-            "calling this tool again with a rephrased question is redundant and just doubles "
-            "latency and failure exposure for no extra coverage. Call it once per question; "
-            "only call it again in the same turn if the user asked about a genuinely different "
-            "topic. Use this instead of answering from your own memory when the question is "
-            "about specific book content."
+            "calling this tool again with a rephrased question, in the SAME turn, is redundant "
+            "and just doubles latency and failure exposure for no extra coverage. Call it once "
+            "per question. A different question later in the conversation -- even about the "
+            "same book or topic -- is a NEW question and must get its own fresh call: do not "
+            "skip calling it because an earlier turn already covered similar ground, and never "
+            "assume a prior attempt's outcome (success, partial result, or failure) still "
+            "applies without calling it again. Use this instead of answering from your own "
+            "memory when the question is about specific book content."
         )
     )
     async def ask_library(question: str) -> str:
