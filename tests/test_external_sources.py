@@ -23,7 +23,6 @@ from library_mcp.external_sources import (
     new_client,
 )
 
-
 # ---------------------------------------------------------------------------
 # Real network tests -- free, no-key, safe to hit directly (§9 step 2)
 # ---------------------------------------------------------------------------
@@ -113,7 +112,7 @@ def _client_with(handler) -> httpx.AsyncClient:
 
 
 async def test_lookup_returns_none_when_search_has_no_hits() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"query": {"search": []}})
 
     source = WikipediaSource()
@@ -122,15 +121,13 @@ async def test_lookup_returns_none_when_search_has_no_hits() -> None:
     assert result is None
 
 
-async def test_lookup_returns_a_result_on_a_clean_search_and_summary(monkeypatch) -> None:
+async def test_lookup_returns_a_result_on_a_clean_search_and_summary() -> None:
     calls = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(str(request.url))
         if "action=query" in str(request.url):
-            return httpx.Response(
-                200, json={"query": {"search": [{"title": "Marcus Aurelius"}]}}
-            )
+            return httpx.Response(200, json={"query": {"search": [{"title": "Marcus Aurelius"}]}})
         return httpx.Response(
             200,
             json={
@@ -177,7 +174,7 @@ async def test_lookup_treats_a_404_summary_as_content_miss_not_infra_down() -> N
 async def test_search_http_5xx_raises_external_source_error() -> None:
     # §3.3: a transport-level failure (HTTP 5xx) must be classified
     # infra_down by the caller, never silently returned as "no result".
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(503)
 
     source = WikipediaSource()
@@ -199,7 +196,7 @@ async def test_summary_http_5xx_raises_external_source_error() -> None:
 
 
 async def test_health_check_returns_false_on_transport_failure_not_a_raise() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(500)
 
     source = WikipediaSource()
@@ -208,7 +205,7 @@ async def test_health_check_returns_false_on_transport_failure_not_a_raise() -> 
 
 
 async def test_health_check_returns_true_on_a_clean_siteinfo_response() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"query": {"general": {"sitename": "Wikipedia"}}})
 
     source = WikipediaSource()

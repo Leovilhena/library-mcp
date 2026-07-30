@@ -30,7 +30,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from http import HTTPStatus
 from typing import Protocol, runtime_checkable
+from urllib.parse import quote
 
 import httpx
 
@@ -38,8 +40,7 @@ import httpx
 # missing/generic User-Agent is treated as a build-blocking bug, not a
 # nice-to-have.
 USER_AGENT = (
-    "Pythia-KnowledgeGapResearch/1.0 "
-    "(personal-use, single-user; contact: leosvilhena@icloud.com)"
+    "Pythia-KnowledgeGapResearch/1.0 (personal-use, single-user; contact: leosvilhena@icloud.com)"
 )
 
 _EXTRACT_MAX_CHARS = 4000
@@ -143,15 +144,13 @@ class _MediaWikiSource:
         """Returns (extract, canonical_url), or None if the page has no
         usable summary (a search hit with no real content -- content_miss,
         not a transport failure)."""
-        from urllib.parse import quote
-
         url = f"{self._rest_base}/page/summary/{quote(title, safe='')}"
         try:
             response = await client.get(url)
         except httpx.HTTPError as exc:
             msg = f"{self.name} summary fetch failed: {exc}"
             raise ExternalSourceError(msg) from exc
-        if response.status_code == 404:
+        if response.status_code == HTTPStatus.NOT_FOUND:
             # A search hit whose page vanished/was renamed -- a real,
             # if unusual, content miss, not an outage.
             return None

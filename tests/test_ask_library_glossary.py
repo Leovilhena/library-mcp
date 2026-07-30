@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, patch
 from library_mcp.audit import AuditLog
 from library_mcp.config import KeeperPolicy
 from library_mcp.keeper_model import AnswerDecision
-from library_mcp.servers.keeper_server import _Deps, _ask, _format_context, _term_lookup_candidate
+from library_mcp.servers.keeper_server import _ask, _Deps, _format_context, _term_lookup_candidate
 from library_mcp.store import (
     GlossaryEntry,
     SearchResult,
@@ -70,8 +70,11 @@ def test_term_lookup_candidate_returns_none_for_unrelated_questions() -> None:
 
 def test_format_context_labels_a_glossary_entry_distinctly_from_chunks() -> None:
     glossary_entry = GlossaryEntry(
-        term="recursion", definition="A function that calls itself.",
-        book_title="A Book", chapter_index=0, model="deepseek-r1:8b",
+        term="recursion",
+        definition="A function that calls itself.",
+        book_title="A Book",
+        chapter_index=0,
+        model="deepseek-r1:8b",
     )
     results = [SearchResult(book_title="A Book", section="ch1", text="raw chunk text", score=0.9)]
 
@@ -106,9 +109,13 @@ async def test_ask_includes_glossary_context_alongside_normal_chunk_search(
     book_id = add_book(conn, "Recursion Book", "/inbox/a.epub", "2026-01-01")
     chapter_id = add_chapter(conn, book_id, 0, "chap1.xhtml")
     add_glossary_term(
-        conn, book_id, chapter_id, "recursion",
+        conn,
+        book_id,
+        chapter_id,
+        "recursion",
         "A function that calls itself to solve smaller instances of a problem.",
-        "deepseek-r1:8b", "2026-07-30T00:00:00",
+        "deepseek-r1:8b",
+        "2026-07-30T00:00:00",
     )
     # Real chunk that a normal search would find -- distinct text from the
     # glossary definition, so the test can tell them apart in the captured
@@ -118,7 +125,7 @@ async def test_ask_includes_glossary_context_alongside_normal_chunk_search(
 
     captured_context: dict[str, str] = {}
 
-    async def _fake_decide(question, context, remaining):
+    async def _fake_decide(_question, context, _remaining):
         captured_context["value"] = context
         return AnswerDecision(text="answered")
 
@@ -151,7 +158,7 @@ async def test_ask_runs_normal_search_even_when_no_glossary_hit_exists(
 
     captured_context: dict[str, str] = {}
 
-    async def _fake_decide(question, context, remaining):
+    async def _fake_decide(_question, context, _remaining):
         captured_context["value"] = context
         return AnswerDecision(text="answered")
 
@@ -177,15 +184,20 @@ async def test_ask_runs_normal_search_for_a_non_term_lookup_question(tmp_path: P
     book_id = add_book(conn, "Some Book", "/inbox/a.epub", "2026-01-01")
     chapter_id = add_chapter(conn, book_id, 0, "chap1.xhtml")
     add_glossary_term(
-        conn, book_id, chapter_id, "recursion", "irrelevant here",
-        "deepseek-r1:8b", "2026-07-30T00:00:00",
+        conn,
+        book_id,
+        chapter_id,
+        "recursion",
+        "irrelevant here",
+        "deepseek-r1:8b",
+        "2026-07-30T00:00:00",
     )
     add_chunk(conn, book_id, 0, "chap1.xhtml", "a broad passage of real content", [1.0, 0.0])
     commit(conn)
 
     captured_context: dict[str, str] = {}
 
-    async def _fake_decide(question, context, remaining):
+    async def _fake_decide(_question, context, _remaining):
         captured_context["value"] = context
         return AnswerDecision(text="answered")
 

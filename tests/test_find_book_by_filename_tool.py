@@ -37,7 +37,9 @@ def test_find_book_by_filename_returns_match_for_done_book(tmp_path: Path) -> No
     lookup_fn = _find_tool(app, "find_book_by_filename")
 
     result = json.loads(
-        lookup_fn(filename="/opt/data/cache/documents/doc_8d70205d2619_Carol_S_Pearson_Awakening_the_Heroes_Within.epub")
+        lookup_fn(
+            filename="/opt/data/cache/documents/doc_8d70205d2619_Carol_S_Pearson_Awakening_the_Heroes_Within.epub"
+        )
     )
 
     assert result["found"] is True

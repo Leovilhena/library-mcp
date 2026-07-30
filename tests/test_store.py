@@ -118,7 +118,7 @@ def test_search_neighbor_expansion_does_not_duplicate_an_already_matched_chunk(
     assert sorted(r.text for r in results) == ["first", "second"]
 
 
-def test_search_streams_via_fetchmany_not_fetchall(tmp_path: Path) -> None:
+def test_search_streams_via_fetchmany_not_fetchall() -> None:
     # BUG-7, 2026-07-30: search() used to fetchall() every chunk's embedding
     # before scoring -- fine at small scale, but a real 56,042-chunk library
     # made the raw embedding JSON alone ~852MB, OOM-killing library-keeper's
@@ -360,7 +360,8 @@ def test_find_book_by_filename_matches_on_basename_regardless_of_prefix(tmp_path
     )
 
     match = find_book_by_filename(
-        conn, "/opt/data/cache/documents/doc_8d70205d2619_Carol_S_Pearson_Awakening_the_Heroes_Within.epub"
+        conn,
+        "/opt/data/cache/documents/doc_8d70205d2619_Carol_S_Pearson_Awakening_the_Heroes_Within.epub",
     )
 
     assert match is not None

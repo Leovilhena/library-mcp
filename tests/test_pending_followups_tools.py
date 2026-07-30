@@ -8,7 +8,12 @@ from pathlib import Path
 from library_mcp.audit import AuditLog, Event
 from library_mcp.config import KeeperPolicy
 from library_mcp.servers.keeper_server import _Deps, build_server
-from library_mcp.store import create_pending_followup, list_pending_followups, mark_gap_resolved, open_store, record_knowledge_gap
+from library_mcp.store import (
+    create_pending_followup,
+    mark_gap_resolved,
+    open_store,
+    record_knowledge_gap,
+)
 
 
 def _deps(tmp_path: Path) -> _Deps:
@@ -18,12 +23,19 @@ def _deps(tmp_path: Path) -> _Deps:
 
 def _seed_followup(deps: _Deps, chat_id: str = "chat1") -> tuple[int, int]:
     conn = open_store(deps.policy.db_path)
-    record_knowledge_gap(conn, "who taught Marcus Aurelius philosophy", "no_matches", "2026-01-01T00:00:00+00:00")
+    record_knowledge_gap(
+        conn, "who taught Marcus Aurelius philosophy", "no_matches", "2026-01-01T00:00:00+00:00"
+    )
     gap_id = conn.execute("SELECT id FROM knowledge_gaps").fetchone()[0]
     mark_gap_resolved(conn, gap_id)
     followup_id = create_pending_followup(
-        conn, gap_id, chat_id, "who taught Marcus Aurelius philosophy",
-        "external_research", "Wikipedia has an answer", "2026-01-02T00:00:00+00:00",
+        conn,
+        gap_id,
+        chat_id,
+        "who taught Marcus Aurelius philosophy",
+        "external_research",
+        "Wikipedia has an answer",
+        "2026-01-02T00:00:00+00:00",
     )
     return gap_id, followup_id
 
@@ -39,7 +51,7 @@ def _find_tool(app, name: str):
 
 def test_list_pending_followups_returns_seeded_row(tmp_path: Path) -> None:
     deps = _deps(tmp_path)
-    gap_id, followup_id = _seed_followup(deps)
+    _gap_id, followup_id = _seed_followup(deps)
     app = build_server(deps.policy, deps.audit)
     list_fn = _find_tool(app, "list_pending_followups")
 

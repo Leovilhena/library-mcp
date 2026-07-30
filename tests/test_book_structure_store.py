@@ -23,8 +23,15 @@ def test_open_store_creates_the_book_structuring_tables(tmp_path: Path) -> None:
     conn = open_store(tmp_path / "test.db")
     book_id = add_book(conn, "A Book", "/inbox/a.epub", "2026-01-01")
     chapter_id = add_chapter(conn, book_id, 0, "chap1.xhtml")
-    add_glossary_term(conn, book_id, chapter_id, "Recursion", "A function calling itself.",
-                       "deepseek-r1:8b", "2026-07-30T00:00:00")
+    add_glossary_term(
+        conn,
+        book_id,
+        chapter_id,
+        "Recursion",
+        "A function calling itself.",
+        "deepseek-r1:8b",
+        "2026-07-30T00:00:00",
+    )
     chapters = list_chapters_for_book(conn, book_id)
     assert len(chapters) == 1
     assert chapters[0].status == "pending"
@@ -83,8 +90,9 @@ def test_mark_chapter_status_sets_model_and_timestamp_without_clobbering(tmp_pat
     book_id = add_book(conn, "A Book", "/inbox/a.epub", "2026-01-01")
     chapter_id = add_chapter(conn, book_id, 0, "chap1.xhtml")
 
-    mark_chapter_status(conn, chapter_id, "done", model="deepseek-r1:8b",
-                         structured_at="2026-07-30T00:00:00")
+    mark_chapter_status(
+        conn, chapter_id, "done", model="deepseek-r1:8b", structured_at="2026-07-30T00:00:00"
+    )
     chapter = list_chapters_for_book(conn, book_id)[0]
     assert chapter.status == "done"
     assert chapter.model == "deepseek-r1:8b"
@@ -165,8 +173,9 @@ def test_list_epub_books_needing_structuring_excludes_fully_done_books(tmp_path:
     conn = open_store(tmp_path / "test.db")
     book_id = add_book(conn, "Done Book", "/inbox/a.epub", "2026-01-01")
     chapter_id = add_chapter(conn, book_id, 0, "chap1.xhtml")
-    mark_chapter_status(conn, chapter_id, "done", model="deepseek-r1:8b",
-                         structured_at="2026-07-30T00:00:00")
+    mark_chapter_status(
+        conn, chapter_id, "done", model="deepseek-r1:8b", structured_at="2026-07-30T00:00:00"
+    )
 
     assert list_epub_books_needing_structuring(conn, limit=10) == []
 
@@ -180,8 +189,9 @@ def test_list_epub_books_needing_structuring_reselects_a_partially_done_book(
     conn = open_store(tmp_path / "test.db")
     book_id = add_book(conn, "Partial Book", "/inbox/a.epub", "2026-01-01")
     done_id = add_chapter(conn, book_id, 0, "chap1.xhtml")
-    mark_chapter_status(conn, done_id, "done", model="deepseek-r1:8b",
-                         structured_at="2026-07-30T00:00:00")
+    mark_chapter_status(
+        conn, done_id, "done", model="deepseek-r1:8b", structured_at="2026-07-30T00:00:00"
+    )
     add_chapter(conn, book_id, 1, "chap2.xhtml")  # still pending
 
     candidates = list_epub_books_needing_structuring(conn, limit=10)
@@ -203,12 +213,24 @@ def test_lookup_glossary_term_exact_match_wins_over_substring(tmp_path: Path) ->
     conn = open_store(tmp_path / "test.db")
     book_id = add_book(conn, "A Book", "/inbox/a.epub", "2026-01-01")
     chapter_id = add_chapter(conn, book_id, 0, "chap1.xhtml")
-    add_glossary_term(conn, book_id, chapter_id, "recursion theorem",
-                       "A longer, unrelated theorem name.", "deepseek-r1:8b",
-                       "2026-07-30T00:00:00")
-    add_glossary_term(conn, book_id, chapter_id, "recursion",
-                       "A function that calls itself.", "deepseek-r1:8b",
-                       "2026-07-30T00:01:00")
+    add_glossary_term(
+        conn,
+        book_id,
+        chapter_id,
+        "recursion theorem",
+        "A longer, unrelated theorem name.",
+        "deepseek-r1:8b",
+        "2026-07-30T00:00:00",
+    )
+    add_glossary_term(
+        conn,
+        book_id,
+        chapter_id,
+        "recursion",
+        "A function that calls itself.",
+        "deepseek-r1:8b",
+        "2026-07-30T00:01:00",
+    )
 
     entry = lookup_glossary_term(conn, "recursion")
     assert entry is not None
@@ -220,8 +242,15 @@ def test_lookup_glossary_term_is_case_insensitive(tmp_path: Path) -> None:
     conn = open_store(tmp_path / "test.db")
     book_id = add_book(conn, "A Book", "/inbox/a.epub", "2026-01-01")
     chapter_id = add_chapter(conn, book_id, 0, "chap1.xhtml")
-    add_glossary_term(conn, book_id, chapter_id, "Recursion", "A function calling itself.",
-                       "deepseek-r1:8b", "2026-07-30T00:00:00")
+    add_glossary_term(
+        conn,
+        book_id,
+        chapter_id,
+        "Recursion",
+        "A function calling itself.",
+        "deepseek-r1:8b",
+        "2026-07-30T00:00:00",
+    )
 
     assert lookup_glossary_term(conn, "recursion") is not None
     assert lookup_glossary_term(conn, "RECURSION") is not None
@@ -231,9 +260,15 @@ def test_lookup_glossary_term_falls_back_to_substring_match(tmp_path: Path) -> N
     conn = open_store(tmp_path / "test.db")
     book_id = add_book(conn, "A Book", "/inbox/a.epub", "2026-01-01")
     chapter_id = add_chapter(conn, book_id, 0, "chap1.xhtml")
-    add_glossary_term(conn, book_id, chapter_id, "tail recursion",
-                       "Recursion where the recursive call is the last action.",
-                       "deepseek-r1:8b", "2026-07-30T00:00:00")
+    add_glossary_term(
+        conn,
+        book_id,
+        chapter_id,
+        "tail recursion",
+        "Recursion where the recursive call is the last action.",
+        "deepseek-r1:8b",
+        "2026-07-30T00:00:00",
+    )
 
     entry = lookup_glossary_term(conn, "recursion")
     assert entry is not None
@@ -261,8 +296,9 @@ def test_book_structuring_status_reports_pending_and_yes(tmp_path: Path) -> None
 
     done_book = add_book(conn, "Done Book", "/inbox/b.epub", "2026-01-02")
     chapter_id = add_chapter(conn, done_book, 0, "chap1.xhtml")
-    mark_chapter_status(conn, chapter_id, "done", model="deepseek-r1:8b",
-                         structured_at="2026-07-30T00:00:00")
+    mark_chapter_status(
+        conn, chapter_id, "done", model="deepseek-r1:8b", structured_at="2026-07-30T00:00:00"
+    )
 
     statuses = {s.title: s.structured for s in book_structuring_status(conn)}
     assert statuses["Pending Book"] == "pending"

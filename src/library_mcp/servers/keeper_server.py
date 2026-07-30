@@ -28,7 +28,6 @@ from library_mcp.store import (
     GlossaryEntry,
     SearchResult,
     find_book_by_filename,
-    list_pending_followups as list_pending_followups_fn,
     lookup_glossary_term,
     mark_followups_delivered,
     open_store,
@@ -36,6 +35,9 @@ from library_mcp.store import (
     search,
 )
 from library_mcp.store import list_knowledge_gaps as list_knowledge_gaps_fn
+from library_mcp.store import (
+    list_pending_followups as list_pending_followups_fn,
+)
 
 # Book structuring (docs/planning/book-structuring.md §4, §9 step 4): a
 # cheap, deterministic pre-check for "does this question look like a
@@ -70,6 +72,19 @@ _TERM_LOOKUP_MAX_WORDS = 6
 # Add any future plugin-injected prefix to this same list as it's
 # discovered -- do not guess at one speculatively.
 _WRAPPER_PREFIXES: tuple[str, ...] = (
+    # Current wording (2026-07-30, reworded same day the "brief" phrasing
+    # was found causing the model to truncate requested content, not just
+    # trim style -- see quiet_mode's own __init__.py for the incident).
+    "[Quiet mode is ON. Answer only the message below. Keep your reply free "
+    "of greetings, small talk, and unnecessary preamble -- get straight to "
+    "the point. This means trimming STYLE, not CONTENT: if the user asked "
+    "for a full list or a complete answer, give the whole thing plainly "
+    "rather than summarizing or truncating it for the sake of brevity. Do "
+    "not ask a follow-up question. Do not bring up earlier topics or add "
+    "commentary beyond what was asked.]",
+    # Prior wording, kept so already-in-flight conversation history (a turn
+    # sent before this rollout, or an older cached agent instance not yet
+    # restarted) still strips cleanly instead of leaking through unmatched.
     "[Quiet mode is ON. Answer only the message below, as briefly as "
     "possible. Do not ask a follow-up question. Do not bring up earlier "
     "topics or add commentary beyond what was asked.]",
@@ -80,7 +95,7 @@ _WRAPPER_PREFIXES: tuple[str, ...] = (
 # quote and punctuation artifacts to trim -- never touches the words of the
 # actual question, only wrapper text and formatting noise around it.
 _WHITESPACE_RE = re.compile(r"\s+")
-_QUOTE_STRIP_CHARS = "\"'“”‘’`"
+_QUOTE_STRIP_CHARS = "\"'“”‘’`"  # noqa: RUF001 -- real curly quotes users actually type, not a typo
 
 
 def _clean_question(question: str) -> str:
@@ -96,8 +111,7 @@ def _clean_question(question: str) -> str:
         if cleaned.startswith(prefix):
             cleaned = cleaned[len(prefix) :]
     cleaned = _WHITESPACE_RE.sub(" ", cleaned).strip()
-    cleaned = cleaned.strip(_QUOTE_STRIP_CHARS).strip()
-    return cleaned
+    return cleaned.strip(_QUOTE_STRIP_CHARS).strip()
 
 
 def _term_lookup_candidate(question: str) -> str | None:
@@ -426,7 +440,7 @@ def build_server(policy: KeeperPolicy, audit: AuditLog) -> FastMCP:
             "frontier model to call on its own initiative -- excluded from "
             "mcp_servers.library_keeper.tools in config.yaml for exactly "
             "that reason. Use ask_library for actually answering questions."
-        )
+        ),
     )
     def find_book_by_filename_tool(filename: str) -> str:
         conn = open_store(deps.policy.db_path)
@@ -464,8 +478,13 @@ def build_server(policy: KeeperPolicy, audit: AuditLog) -> FastMCP:
         injected_at = datetime.now(UTC).isoformat()
         delivered = mark_followups_delivered(conn, followup_ids, injected_at)
         if delivered:
+            # The f-string below only builds the placeholder skeleton (a run
+            # of literal `?` characters sized from len(delivered), an int)
+            # -- never interpolates data. Every real value still goes
+            # through parameterized binding, the standard-safe pattern for
+            # a variable-length SQLite IN clause.
             rows = conn.execute(
-                "SELECT id, gap_id, chat_id FROM pending_followups WHERE id IN "
+                "SELECT id, gap_id, chat_id FROM pending_followups WHERE id IN "  # noqa: S608  # nosec B608
                 f"({','.join('?' * len(delivered))})",
                 delivered,
             ).fetchall()

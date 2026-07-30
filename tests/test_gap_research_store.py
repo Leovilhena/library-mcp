@@ -96,7 +96,9 @@ def test_infra_down_never_increments_the_attempt_counter(tmp_path: Path) -> None
     record_knowledge_gap(conn, "q", "no_matches", "2026-01-01T00:00:00+00:00")
     gap_id = list_open_gaps(conn)[0].id
 
-    record_external_research(conn, gap_id, "q", "wikipedia", "infra_down", "2026-01-02T00:00:00+00:00")
+    record_external_research(
+        conn, gap_id, "q", "wikipedia", "infra_down", "2026-01-02T00:00:00+00:00"
+    )
     # No increment_external_attempt_count call for infra_down -- verifying
     # the store layer doesn't do it implicitly either.
     assert list_open_gaps(conn)[0].external_attempt_count == 0
@@ -107,7 +109,9 @@ def test_latest_external_research_returns_the_most_recent_row(tmp_path: Path) ->
     record_knowledge_gap(conn, "q", "no_matches", "2026-01-01T00:00:00+00:00")
     gap_id = list_open_gaps(conn)[0].id
 
-    record_external_research(conn, gap_id, "q", "wikipedia", "content_miss", "2026-01-01T00:00:00+00:00")
+    record_external_research(
+        conn, gap_id, "q", "wikipedia", "content_miss", "2026-01-01T00:00:00+00:00"
+    )
     record_external_research(conn, gap_id, "q", "wikipedia", "found", "2026-01-08T00:00:00+00:00")
 
     latest = latest_external_research(conn, gap_id, "wikipedia")
@@ -152,7 +156,12 @@ def test_pending_followups_respects_the_per_chat_limit(tmp_path: Path) -> None:
     for i, gap_id in enumerate(gap_ids):
         mark_gap_resolved(conn, gap_id)
         create_pending_followup(
-            conn, gap_id, "chat1", f"q{i}", "book_deepen", f"answer {i}",
+            conn,
+            gap_id,
+            "chat1",
+            f"q{i}",
+            "book_deepen",
+            f"answer {i}",
             f"2026-01-0{i + 1}T00:00:00+00:00",
         )
 

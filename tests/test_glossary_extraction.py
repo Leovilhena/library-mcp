@@ -4,7 +4,8 @@
 `_parse_glossary` is tested directly against fixture text (no Ollama
 needed) -- the format-fragility case that matters most here, since
 `deepseek-r1:8b` wraps output in a `<think>` block and this stack's small
-models are only 40-60% reliable at strict formatting. `test_extract_glossary_terms_against_real_ollama`
+models are only 40-60% reliable at strict formatting.
+`test_extract_glossary_terms_against_real_ollama`
 is a real integration test (skipped if Ollama is unreachable) confirming
 the live model actually produces parseable pairs, not just that the parser
 handles a fixture correctly.
@@ -17,7 +18,12 @@ import asyncio
 import httpx
 import pytest
 
-from library_mcp.keeper_model import GlossaryCandidate, ReasoningClient, ReasoningError, _parse_glossary
+from library_mcp.keeper_model import (
+    GlossaryCandidate,
+    ReasoningClient,
+    ReasoningError,
+    _parse_glossary,
+)
 
 # ---------------------------------------------------------------------------
 # _parse_glossary: pure-function tests against fixture text
@@ -42,8 +48,7 @@ def test_parse_glossary_extracts_clean_pairs() -> None:
         ),
         GlossaryCandidate(
             term="Base case",
-            definition="The condition that stops a recursive function from "
-            "calling itself forever.",
+            definition="The condition that stops a recursive function from calling itself forever.",
         ),
     ]
 
@@ -61,8 +66,7 @@ def test_parse_glossary_strips_a_think_block_first() -> None:
     assert result == [
         GlossaryCandidate(
             term="Asyncio",
-            definition="Python's library for writing concurrent code using the "
-            "async/await syntax.",
+            definition="Python's library for writing concurrent code using the async/await syntax.",
         )
     ]
 
@@ -131,11 +135,12 @@ def test_parse_glossary_falls_back_to_a_json_array_response() -> None:
     # TERM:/DEFINITION: instruction, one real response ignored the format
     # and returned a fenced JSON array instead.
     text = (
-        'Okay, here is a glossary:\n\n1. **Real Good**\n2. **True Happiness**\n\n'
+        "Okay, here is a glossary:\n\n1. **Real Good**\n2. **True Happiness**\n\n"
         '```json\n[\n    {\n        "term": "real good",\n        '
         '"definition": "That which communicates itself through the intellect alone."\n    },\n'
         '    {\n        "term": "true happiness",\n        '
-        '"definition": "Continuous, supreme joy derived from possessing the real good."\n    }\n]\n```'
+        '"definition": "Continuous, supreme joy derived from possessing the real '
+        'good."\n    }\n]\n```'
     )
     result = _parse_glossary(text)
     assert result == [
@@ -156,8 +161,10 @@ def test_parse_glossary_json_fallback_ignores_malformed_json() -> None:
 
 
 def test_parse_glossary_json_fallback_skips_entries_missing_term_or_definition() -> None:
-    text = '[{"term": "only a term"}, {"definition": "only a definition"}, ' \
-           '{"term": "complete", "definition": "has both"}]'
+    text = (
+        '[{"term": "only a term"}, {"definition": "only a definition"}, '
+        '{"term": "complete", "definition": "has both"}]'
+    )
     result = _parse_glossary(text)
     assert result == [GlossaryCandidate(term="complete", definition="has both")]
 
@@ -168,10 +175,12 @@ def test_parse_glossary_line_based_format_wins_over_json_fallback() -> None:
     # coincidental bracket elsewhere in the text).
     text = (
         "TERM: Recursion\nDEFINITION: A function that calls itself.\n"
-        'Some stray text with [brackets] that is not JSON.'
+        "Some stray text with [brackets] that is not JSON."
     )
     result = _parse_glossary(text)
-    assert result == [GlossaryCandidate(term="Recursion", definition="A function that calls itself.")]
+    assert result == [
+        GlossaryCandidate(term="Recursion", definition="A function that calls itself.")
+    ]
 
 
 def test_parse_glossary_is_tolerant_of_blended_prose() -> None:
@@ -230,12 +239,10 @@ def test_extract_glossary_terms_raises_reasoning_error_on_transport_failure(monk
             async def __aexit__(self, *exc):
                 return False
 
-            async def post(self, *args, **kwargs):
+            async def post(self, *_args, **_kwargs):
                 raise httpx.ConnectError("connection refused")
 
-        monkeypatch.setattr(
-            "library_mcp.keeper_model.httpx.AsyncClient", _FailingAsyncClient
-        )
+        monkeypatch.setattr("library_mcp.keeper_model.httpx.AsyncClient", _FailingAsyncClient)
         with pytest.raises(ReasoningError):
             await client.extract_glossary_terms("Some chapter text.")
 

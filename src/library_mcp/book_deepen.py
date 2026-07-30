@@ -18,6 +18,7 @@ the opposite trade `KeeperPolicy`'s defaults make for the interactive tool.
 
 from __future__ import annotations
 
+import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -66,7 +67,7 @@ def _format_context(results: list[SearchResult], max_chars: int) -> str:
 
 
 async def deepen(
-    conn,
+    conn: sqlite3.Connection,
     audit: AuditLog,
     gap_id: int,
     question: str,

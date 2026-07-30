@@ -76,7 +76,9 @@ async def test_deepen_stops_on_a_repeated_query_without_crashing(tmp_path: Path)
         patch("library_mcp.book_deepen.ReasoningClient") as mock_reason,
     ):
         mock_embed.return_value.embed = AsyncMock(return_value=[1.0, 0.0])
-        mock_reason.return_value.decide = AsyncMock(return_value=SearchDecision(query="a hard question"))
+        mock_reason.return_value.decide = AsyncMock(
+            return_value=SearchDecision(query="a hard question")
+        )
 
         answer = await deepen(conn, audit, gap_id=1, question="a hard question", config=_config())
 
@@ -96,7 +98,7 @@ async def test_deepen_max_searches_is_still_enforced(tmp_path: Path) -> None:
 
     call_count = 0
 
-    async def _always_search(query, context, remaining):
+    async def _always_search(_query, _context, _remaining):
         nonlocal call_count
         call_count += 1
         return SearchDecision(query=f"query {call_count}")

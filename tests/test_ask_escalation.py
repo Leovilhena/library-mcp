@@ -129,7 +129,9 @@ async def test_ask_structured_repeated_query_sets_status_and_gap_id(tmp_path: Pa
         patch("library_mcp.servers.keeper_server.ReasoningClient") as mock_reason,
     ):
         mock_embed.return_value.embed = AsyncMock(return_value=[1.0, 0.0])
-        mock_reason.return_value.decide = AsyncMock(return_value=SearchDecision(query="still looking"))
+        mock_reason.return_value.decide = AsyncMock(
+            return_value=SearchDecision(query="still looking")
+        )
 
         outcome = await _ask_structured(deps, "a hard question")
 
@@ -202,7 +204,9 @@ async def test_ask_returns_interim_reply_for_repeated_query(tmp_path: Path) -> N
         patch("library_mcp.servers.keeper_server.ReasoningClient") as mock_reason,
     ):
         mock_embed.return_value.embed = AsyncMock(return_value=[1.0, 0.0])
-        mock_reason.return_value.decide = AsyncMock(return_value=SearchDecision(query="still looking"))
+        mock_reason.return_value.decide = AsyncMock(
+            return_value=SearchDecision(query="still looking")
+        )
 
         result = await _ask(deps, "a hard question")
 

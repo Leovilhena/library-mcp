@@ -513,8 +513,17 @@ def record_knowledge_gap(
             (question, reason, asked_at, asked_at),
         )
         gap_id = cursor.lastrowid
+        # lastrowid is only None when no INSERT has happened on this cursor
+        # yet, which can't be true here -- the INSERT just above is what
+        # this is reading it from. A real check, not just satisfying mypy:
+        # `assert` gets stripped under `python -O`, so this can't rely on
+        # one for something that would otherwise silently return a bogus
+        # id to a caller (bandit B101 -- correctly flagged, not suppressed).
+        if gap_id is None:
+            msg = "INSERT into knowledge_gaps did not produce a lastrowid"
+            raise RuntimeError(msg)
     conn.commit()
-    return gap_id
+    return int(gap_id)
 
 
 def list_knowledge_gaps(conn: sqlite3.Connection) -> list[KnowledgeGap]:
@@ -536,6 +545,11 @@ def _cosine(a: list[float], b: list[float]) -> float:
     if norm_a == 0.0 or norm_b == 0.0:
         return 0.0
     return dot / (norm_a * norm_b)
+
+
+# Module-level (not a local inside search()) so it reads as the real tuning
+# constant it is, rather than a per-call magic number.
+_SEARCH_BATCH_SIZE = 500
 
 
 def search(
@@ -589,7 +603,6 @@ def search(
     # ever touching row content for comparison.
     heap: list[tuple[float, int, tuple[int, int, int, str | None, str, str]]] = []
     counter = 0
-    _SEARCH_BATCH_SIZE = 500
     while True:
         batch = cursor.fetchmany(_SEARCH_BATCH_SIZE)
         if not batch:
@@ -603,9 +616,7 @@ def search(
             elif top_k > 0 and score > heap[0][0]:
                 heapq.heapreplace(heap, (score, counter, row_data))
             counter += 1
-    top = [
-        (score, *row_data) for score, _counter, row_data in sorted(heap, reverse=True)
-    ]
+    top = [(score, *row_data) for score, _counter, row_data in sorted(heap, reverse=True)]
 
     seen_chunk_ids = {chunk_id for _, chunk_id, *_ in top}
     results = [
@@ -616,8 +627,7 @@ def search(
     for score, _chunk_id, book_id, chunk_index, section, _text, title in top:
         for neighbor_index in (chunk_index - 1, chunk_index + 1):
             neighbor = conn.execute(
-                "SELECT id, section, text FROM chunks "
-                "WHERE book_id = ? AND chunk_index = ?",
+                "SELECT id, section, text FROM chunks WHERE book_id = ? AND chunk_index = ?",
                 (book_id, neighbor_index),
             ).fetchone()
             if neighbor is None:
@@ -812,8 +822,13 @@ def list_pending_followups(
     ).fetchall()
     return [
         PendingFollowup(
-            id=int(i), gap_id=int(g), chat_id=c, question=q, resolution_kind=rk,
-            summary=s, resolved_at=ra,
+            id=int(i),
+            gap_id=int(g),
+            chat_id=c,
+            question=q,
+            resolution_kind=rk,
+            summary=s,
+            resolved_at=ra,
         )
         for i, g, c, q, rk, s, ra in rows
     ]
@@ -855,8 +870,13 @@ def expire_stale_followups(
     ).fetchall()
     expired = [
         PendingFollowup(
-            id=int(i), gap_id=int(g), chat_id=c, question=q, resolution_kind=rk,
-            summary=s, resolved_at=ra,
+            id=int(i),
+            gap_id=int(g),
+            chat_id=c,
+            question=q,
+            resolution_kind=rk,
+            summary=s,
+            resolved_at=ra,
         )
         for i, g, c, q, rk, s, ra in rows
     ]
@@ -966,8 +986,13 @@ def list_chapters_for_book(conn: sqlite3.Connection, book_id: int) -> list[BookC
     ).fetchall()
     return [
         BookChapter(
-            id=int(i), book_id=int(b), chapter_index=int(ci), section=s,
-            status=status, model=m, structured_at=sa,
+            id=int(i),
+            book_id=int(b),
+            chapter_index=int(ci),
+            section=s,
+            status=status,
+            model=m,
+            structured_at=sa,
         )
         for i, b, ci, s, status, m, sa in rows
     ]
@@ -1028,7 +1053,9 @@ def lookup_glossary_term(conn: sqlite3.Connection, term: str) -> GlossaryEntry |
         return None
     term_, definition, title, chapter_index, model = row
     return GlossaryEntry(
-        term=term_, definition=definition, book_title=title,
+        term=term_,
+        definition=definition,
+        book_title=title,
         chapter_index=int(chapter_index) if chapter_index is not None else None,
         model=model,
     )
@@ -1043,9 +1070,7 @@ def book_structuring_status(conn: sqlite3.Connection) -> list[BookStructuringSta
     view, not a new tool.
     """
     books = conn.execute("SELECT id, title FROM books ORDER BY id").fetchall()
-    statuses = conn.execute(
-        "SELECT book_id, status FROM book_chapters"
-    ).fetchall()
+    statuses = conn.execute("SELECT book_id, status FROM book_chapters").fetchall()
     by_book: dict[int, list[str]] = {}
     for book_id, status in statuses:
         by_book.setdefault(int(book_id), []).append(status)
