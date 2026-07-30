@@ -46,7 +46,8 @@ or a chat message that could redirect this to some other server.
 More on how this was actually built and debugged — including the real bugs
 found along the way (a small reasoning model not following instructions
 reliably, an EPUB's table of contents accidentally confusing search results,
-a tricky container-permissions issue) — is written up in the Pythia stack's
+Project Gutenberg's own licence text getting ingested and summarized as if it
+were the book, a tricky container-permissions issue) — is written up in the Pythia stack's
 own docs: `hermes-stack/docs/architecture/library-mcp.md`.
 
 ## Development

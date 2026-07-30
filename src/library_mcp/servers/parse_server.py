@@ -208,6 +208,7 @@ async def _ingest_in_background(
                 book_id=book_id,
                 chunk_index=i,
                 section=chunk.section,
+                section_title=chunk.title,
                 text=chunk.text,
                 embedding=vector,
             )

@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     book_id INTEGER NOT NULL REFERENCES books(id),
     chunk_index INTEGER NOT NULL,
     section TEXT,
+    section_title TEXT,
     text TEXT NOT NULL,
     embedding TEXT NOT NULL
 );
@@ -96,6 +97,7 @@ CREATE TABLE IF NOT EXISTS book_chapters (
     book_id INTEGER NOT NULL REFERENCES books(id),
     chapter_index INTEGER NOT NULL,
     section TEXT NOT NULL,
+    title TEXT,
     summary TEXT,
     status TEXT NOT NULL DEFAULT 'pending',
     model TEXT,
@@ -144,6 +146,20 @@ _MIGRATION_COLUMNS = {
 _KNOWLEDGE_GAPS_MIGRATION_COLUMNS = {
     "external_attempt_count": "INTEGER NOT NULL DEFAULT 0",
     "giving_up": "INTEGER NOT NULL DEFAULT 0",
+}
+
+# EPUB table-of-contents titles (2026-07-30). Additive on both tables, same
+# migration pattern as the two dicts above: `section` keeps its existing
+# contract as the stable grouping key and these carry the book's own real,
+# human-readable chapter title *when it has one*. NULL everywhere for
+# already-ingested books and for any book without a usable TOC, which every
+# reader must tolerate -- nothing is backfilled, because the source file is
+# often no longer on disk by the time this runs.
+_CHUNKS_MIGRATION_COLUMNS = {
+    "section_title": "TEXT",
+}
+_BOOK_CHAPTERS_MIGRATION_COLUMNS = {
+    "title": "TEXT",
 }
 
 
@@ -225,6 +241,10 @@ class BookChapter:
     book_id: int
     chapter_index: int
     section: str
+    # The book's own TOC title for this chapter when it declares one
+    # (2026-07-30); None for every chapter claimed before that and for any
+    # book without a usable TOC. `section` remains the identity key.
+    title: str | None
     status: str
     model: str | None
     structured_at: str | None
@@ -271,6 +291,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
     for column, definition in _KNOWLEDGE_GAPS_MIGRATION_COLUMNS.items():
         if column not in existing_gap_columns:
             conn.execute(f"ALTER TABLE knowledge_gaps ADD COLUMN {column} {definition}")
+
+    existing_chunk_columns = {row[1] for row in conn.execute("PRAGMA table_info(chunks)")}
+    for column, definition in _CHUNKS_MIGRATION_COLUMNS.items():
+        if column not in existing_chunk_columns:
+            conn.execute(f"ALTER TABLE chunks ADD COLUMN {column} {definition}")
+
+    existing_chapter_columns = {row[1] for row in conn.execute("PRAGMA table_info(book_chapters)")}
+    for column, definition in _BOOK_CHAPTERS_MIGRATION_COLUMNS.items():
+        if column not in existing_chapter_columns:
+            conn.execute(f"ALTER TABLE book_chapters ADD COLUMN {column} {definition}")
 
     # All three backfills below run unconditionally on every open_store()
     # call, not gated on "did *this* ALTER TABLE just run" -- deliberately.
@@ -460,11 +490,12 @@ def add_chunk(
     section: str | None,
     text: str,
     embedding: list[float],
+    section_title: str | None = None,
 ) -> None:
     conn.execute(
-        "INSERT INTO chunks (book_id, chunk_index, section, text, embedding) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (book_id, chunk_index, section, text, json.dumps(embedding)),
+        "INSERT INTO chunks (book_id, chunk_index, section, section_title, text, embedding) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (book_id, chunk_index, section, section_title, text, json.dumps(embedding)),
     )
 
 
@@ -951,11 +982,35 @@ def list_sections_for_book(conn: sqlite3.Connection, book_id: int) -> list[tuple
     return [(section, "\n".join(parts[section])) for section in order]
 
 
-def add_chapter(conn: sqlite3.Connection, book_id: int, chapter_index: int, section: str) -> int:
+def list_section_titles_for_book(conn: sqlite3.Connection, book_id: int) -> dict[str, str]:
+    """{section: the book's own TOC title for it}, for sections that have one.
+
+    Deliberately a separate lookup rather than a third element on
+    `list_sections_for_book`'s tuples: that function's 2-tuple shape is
+    already read by `reflex/book_structure.py` and its tests, and a title is
+    optional metadata (absent for every book ingested before 2026-07-30, and
+    for any book whose EPUB has no usable TOC), not part of the chapter
+    text contract.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT section, section_title FROM chunks "
+        "WHERE book_id = ? AND section IS NOT NULL AND section_title IS NOT NULL",
+        (book_id,),
+    ).fetchall()
+    return {section: title for section, title in rows if title}
+
+
+def add_chapter(
+    conn: sqlite3.Connection,
+    book_id: int,
+    chapter_index: int,
+    section: str,
+    title: str | None = None,
+) -> int:
     cur = conn.execute(
-        "INSERT INTO book_chapters (book_id, chapter_index, section, status) "
-        "VALUES (?, ?, ?, 'pending')",
-        (book_id, chapter_index, section),
+        "INSERT INTO book_chapters (book_id, chapter_index, section, title, status) "
+        "VALUES (?, ?, ?, ?, 'pending')",
+        (book_id, chapter_index, section, title),
     )
     conn.commit()
     return int(cur.lastrowid)  # type: ignore[arg-type]
@@ -980,22 +1035,68 @@ def mark_chapter_status(
 
 def list_chapters_for_book(conn: sqlite3.Connection, book_id: int) -> list[BookChapter]:
     rows = conn.execute(
-        "SELECT id, book_id, chapter_index, section, status, model, structured_at "
+        "SELECT id, book_id, chapter_index, section, title, status, model, structured_at "
         "FROM book_chapters WHERE book_id = ? ORDER BY chapter_index",
         (book_id,),
     ).fetchall()
-    return [
-        BookChapter(
-            id=int(i),
-            book_id=int(b),
-            chapter_index=int(ci),
-            section=s,
-            status=status,
-            model=m,
-            structured_at=sa,
-        )
-        for i, b, ci, s, status, m, sa in rows
-    ]
+    return [_chapter_from_row(row) for row in rows]
+
+
+def _chapter_from_row(
+    row: tuple[int, int, int, str, str | None, str, str | None, str | None],
+) -> BookChapter:
+    i, b, ci, s, t, status, m, sa = row
+    return BookChapter(
+        id=int(i),
+        book_id=int(b),
+        chapter_index=int(ci),
+        section=s,
+        title=t,
+        status=status,
+        model=m,
+        structured_at=sa,
+    )
+
+
+def list_chapters_by_status(conn: sqlite3.Connection, status: str, limit: int) -> list[BookChapter]:
+    """Oldest-`structured_at`-first chapters in one status, capped.
+
+    The retroactive Gutenberg-contamination sweep (reflex/book_structure.py)
+    is the only caller: it re-checks already-`done` chapters against the
+    current boilerplate detector. Oldest-first and capped for the same
+    reason `list_epub_books_needing_structuring` is -- the nightly window is
+    shared, and an unbounded backfill is exactly the failure mode that
+    batch limit exists to prevent.
+    """
+    rows = conn.execute(
+        "SELECT id, book_id, chapter_index, section, title, status, model, structured_at "
+        "FROM book_chapters WHERE status = ? ORDER BY structured_at, id LIMIT ?",
+        (status, limit),
+    ).fetchall()
+    return [_chapter_from_row(row) for row in rows]
+
+
+def list_glossary_terms_for_chapter(
+    conn: sqlite3.Connection, chapter_id: int
+) -> list[tuple[str, str]]:
+    """Every (term, definition) pair extracted from one chapter."""
+    rows = conn.execute(
+        "SELECT term, definition FROM book_glossary_terms WHERE chapter_id = ? ORDER BY id",
+        (chapter_id,),
+    ).fetchall()
+    return [(term, definition) for term, definition in rows]
+
+
+def delete_glossary_terms_for_chapter(conn: sqlite3.Connection, chapter_id: int) -> int:
+    """Drop every glossary row extracted from one chapter; returns the count.
+
+    Used only to retract contaminated output (terms extracted from Project
+    Gutenberg's license rather than the book), so that the chapter can be
+    re-extracted from clean text.
+    """
+    cur = conn.execute("DELETE FROM book_glossary_terms WHERE chapter_id = ?", (chapter_id,))
+    conn.commit()
+    return int(cur.rowcount or 0)
 
 
 def add_glossary_term(

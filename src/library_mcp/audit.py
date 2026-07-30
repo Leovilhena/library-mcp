@@ -66,6 +66,10 @@ class Event(StrEnum):
     CHAPTER_STRUCTURED = "chapter_structured"
     GLOSSARY_EXTRACTED = "glossary_extracted"
     STRUCTURING_FAILED = "structuring_failed"
+    # Retroactive Gutenberg-boilerplate sweep (2026-07-30): a chapter whose
+    # glossary was extracted from Project Gutenberg's license rather than
+    # from the book had its terms retracted and was re-queued.
+    BOILERPLATE_RETRACTED = "boilerplate_retracted"
 
 
 _MAX_FIELD_CHARS = 2000
