@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, patch
 from library_mcp.audit import AuditLog
 from library_mcp.config import KeeperPolicy
 from library_mcp.embedding import EmbeddingError
+from library_mcp.external_sources import ExternalResult, ExternalSourceError
 from library_mcp.keeper_model import AnswerDecision, ReasoningError, SearchDecision
 from library_mcp.servers.keeper_server import (
     _NO_MATCHES_INTERIM_REPLY,
@@ -174,15 +175,20 @@ async def test_ask_structured_reasoning_failed_has_no_gap_id(tmp_path: Path) -> 
 
 
 async def test_ask_returns_interim_reply_for_no_matches(tmp_path: Path) -> None:
+    # Both the book search AND the live web fallback come up empty here --
+    # the honest interim reply is what's left. See the *_web_fallback tests
+    # below for the case where the web search actually finds something.
     deps = _deps(tmp_path)
     with (
         patch("library_mcp.servers.keeper_server.EmbeddingClient") as mock_embed,
         patch("library_mcp.servers.keeper_server.ReasoningClient") as mock_reason,
+        patch("library_mcp.servers.keeper_server.DdgsSource") as mock_ddgs,
     ):
         mock_embed.return_value.embed = AsyncMock(return_value=[1.0, 0.0])
         mock_reason.return_value.decide = AsyncMock(
             return_value=AnswerDecision(text="The passages don't cover this.")
         )
+        mock_ddgs.return_value.lookup = AsyncMock(return_value=None)
 
         result = await _ask(deps, "what does the book say about zorbnaxx?")
 
@@ -202,16 +208,107 @@ async def test_ask_returns_interim_reply_for_repeated_query(tmp_path: Path) -> N
     with (
         patch("library_mcp.servers.keeper_server.EmbeddingClient") as mock_embed,
         patch("library_mcp.servers.keeper_server.ReasoningClient") as mock_reason,
+        patch("library_mcp.servers.keeper_server.DdgsSource") as mock_ddgs,
     ):
         mock_embed.return_value.embed = AsyncMock(return_value=[1.0, 0.0])
         mock_reason.return_value.decide = AsyncMock(
             return_value=SearchDecision(query="still looking")
         )
+        mock_ddgs.return_value.lookup = AsyncMock(return_value=None)
 
         result = await _ask(deps, "a hard question")
 
     assert result == _REPEATED_QUERY_INTERIM_REPLY
     assert "Closest passages found" not in result
+
+
+# ---------------------------------------------------------------------------
+# Live web fallback (new): tried within the same turn when the book search
+# comes up empty, before falling back to the honest interim reply.
+# ---------------------------------------------------------------------------
+
+
+async def test_ask_uses_live_web_fallback_when_book_search_finds_nothing(tmp_path: Path) -> None:
+    deps = _deps(tmp_path)
+    with (
+        patch("library_mcp.servers.keeper_server.EmbeddingClient") as mock_embed,
+        patch("library_mcp.servers.keeper_server.ReasoningClient") as mock_reason,
+        patch("library_mcp.servers.keeper_server.DdgsSource") as mock_ddgs,
+    ):
+        mock_embed.return_value.embed = AsyncMock(return_value=[1.0, 0.0])
+        mock_reason.return_value.decide = AsyncMock(
+            return_value=AnswerDecision(text="The passages don't cover this.")
+        )
+        mock_ddgs.return_value.lookup = AsyncMock(
+            return_value=ExternalResult(
+                source="web",
+                title="what does the book say about zorbnaxx?",
+                url="https://example.com/zorbnaxx",
+                extract="Zorbnaxx is a fictional example term.",
+                fetched_at="2026-08-04T00:00:00+00:00",
+            )
+        )
+
+        result = await _ask(deps, "what does the book say about zorbnaxx?")
+
+    # Never silently returns the interim "let me dig deeper" reply when a
+    # real web answer was found -- and never claims book-grounding for it.
+    assert result != _NO_MATCHES_INTERIM_REPLY
+    assert "doesn't cover this" in result
+    assert "Zorbnaxx is a fictional example term." in result
+    assert "https://example.com/zorbnaxx" in result
+
+
+async def test_ask_falls_back_to_interim_reply_when_web_search_errors(tmp_path: Path) -> None:
+    # A broken web search (timeout, worker crash, etc.) must fail open to
+    # the existing honest interim reply -- never surface as an error to the
+    # user, never block the answer path that already worked before this
+    # feature existed.
+    deps = _deps(tmp_path)
+    with (
+        patch("library_mcp.servers.keeper_server.EmbeddingClient") as mock_embed,
+        patch("library_mcp.servers.keeper_server.ReasoningClient") as mock_reason,
+        patch("library_mcp.servers.keeper_server.DdgsSource") as mock_ddgs,
+    ):
+        mock_embed.return_value.embed = AsyncMock(return_value=[1.0, 0.0])
+        mock_reason.return_value.decide = AsyncMock(
+            return_value=AnswerDecision(text="The passages don't cover this.")
+        )
+        mock_ddgs.return_value.lookup = AsyncMock(
+            side_effect=ExternalSourceError("web search timed out after 20.0s")
+        )
+
+        result = await _ask(deps, "what does the book say about zorbnaxx?")
+
+    assert result == _NO_MATCHES_INTERIM_REPLY
+
+
+async def test_ask_does_not_use_live_web_fallback_when_the_book_answers(tmp_path: Path) -> None:
+    # A real book answer must never be second-guessed or replaced by a web
+    # search -- the fallback path is only reachable for no_matches/
+    # repeated_query_no_answer, never for a genuine "answered" outcome.
+    deps = _deps(tmp_path)
+    conn = open_store(deps.policy.db_path)
+    book_id = add_book(conn, "Some Book", "/inbox/a.pdf", "2026-01-01")
+    add_chunk(conn, book_id, 0, "p1", "relevant passage", [1.0, 0.0])
+    commit(conn)
+
+    with (
+        patch("library_mcp.servers.keeper_server.EmbeddingClient") as mock_embed,
+        patch("library_mcp.servers.keeper_server.ReasoningClient") as mock_reason,
+        patch("library_mcp.servers.keeper_server.DdgsSource") as mock_ddgs,
+    ):
+        mock_embed.return_value.embed = AsyncMock(return_value=[1.0, 0.0])
+        mock_reason.return_value.decide = AsyncMock(
+            return_value=AnswerDecision(text="Here's the answer.")
+        )
+        mock_ddgs.return_value.lookup = AsyncMock(
+            side_effect=AssertionError("DdgsSource.lookup must not be called when the book answers")
+        )
+
+        result = await _ask(deps, "a real question")
+
+    assert result == "Here's the answer."
 
 
 async def test_ask_does_not_reframe_embed_failure_as_a_knowledge_gap(tmp_path: Path) -> None:

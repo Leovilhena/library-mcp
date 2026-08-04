@@ -11,11 +11,16 @@ plus fixture-based/mocked tests that don't need network access, for CI.
 
 from __future__ import annotations
 
+import asyncio
+import json
+from unittest.mock import AsyncMock, patch
+
 import httpx
 import pytest
 
 from library_mcp.external_sources import (
     USER_AGENT,
+    DdgsSource,
     ExternalSourceError,
     WikipediaSource,
     WikiquoteSource,
@@ -77,9 +82,20 @@ async def test_wikiquote_lookup_finds_a_real_page() -> None:
     assert result.extract
 
 
-def test_default_sources_are_ordered_wikipedia_first() -> None:
+@pytest.mark.network
+async def test_ddgs_lookup_finds_a_real_result() -> None:
+    source = DdgsSource()
+    async with new_client() as client:
+        result = await source.lookup(client, "Marcus Aurelius Roman emperor")
+    assert result is not None
+    assert result.source == "web"
+    assert result.extract
+    assert result.url
+
+
+def test_default_sources_are_ordered_wikipedia_wikiquote_then_web() -> None:
     sources = default_sources()
-    assert [s.name for s in sources] == ["wikipedia", "wikiquote"]
+    assert [s.name for s in sources] == ["wikipedia", "wikiquote", "web"]
 
 
 def test_user_agent_names_the_app_and_contact() -> None:
@@ -211,3 +227,112 @@ async def test_health_check_returns_true_on_a_clean_siteinfo_response() -> None:
     source = WikipediaSource()
     async with _client_with(handler) as client:
         assert await source.health_check(client) is True
+
+
+# ---------------------------------------------------------------------------
+# DdgsSource -- mocked subprocess, offline, for CI
+# ---------------------------------------------------------------------------
+
+
+class _FakeProc:
+    def __init__(self, stdout: bytes = b"", raise_communicate: Exception | None = None) -> None:
+        self._stdout = stdout
+        self._raise = raise_communicate
+        self.killed = False
+        self.waited = False
+
+    async def communicate(self, _input: bytes) -> tuple[bytes, bytes]:
+        if self._raise is not None:
+            raise self._raise
+        return self._stdout, b""
+
+    def kill(self) -> None:
+        self.killed = True
+
+    async def wait(self) -> None:
+        self.waited = True
+
+
+def _patch_subprocess(proc: _FakeProc):
+    return patch(
+        "library_mcp.external_sources.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=proc),
+    )
+
+
+async def test_ddgs_lookup_returns_a_result_on_a_successful_worker_run() -> None:
+    envelope = {
+        "ok": True,
+        "results": [
+            {"title": "Marcus Aurelius", "url": "https://example.com/ma", "body": "Roman emperor."}
+        ],
+    }
+    proc = _FakeProc(stdout=json.dumps(envelope).encode())
+    with _patch_subprocess(proc):
+        result = await DdgsSource().lookup(httpx.AsyncClient(), "who was Marcus Aurelius")
+    assert result is not None
+    assert result.source == "web"
+    assert result.url == "https://example.com/ma"
+    assert "Marcus Aurelius" in result.extract
+    assert "Roman emperor" in result.extract
+
+
+async def test_ddgs_lookup_returns_none_on_empty_results() -> None:
+    proc = _FakeProc(stdout=json.dumps({"ok": True, "results": []}).encode())
+    with _patch_subprocess(proc):
+        result = await DdgsSource().lookup(httpx.AsyncClient(), "no such topic")
+    assert result is None
+
+
+async def test_ddgs_lookup_raises_external_source_error_on_worker_failure() -> None:
+    proc = _FakeProc(stdout=json.dumps({"ok": False, "error": "RuntimeError: boom"}).encode())
+    with _patch_subprocess(proc), pytest.raises(ExternalSourceError):
+        await DdgsSource().lookup(httpx.AsyncClient(), "something")
+
+
+async def test_ddgs_lookup_raises_external_source_error_on_invalid_json() -> None:
+    proc = _FakeProc(stdout=b"not json")
+    with _patch_subprocess(proc), pytest.raises(ExternalSourceError):
+        await DdgsSource().lookup(httpx.AsyncClient(), "something")
+
+
+async def test_ddgs_lookup_raises_external_source_error_when_subprocess_fails_to_start() -> None:
+    with (
+        patch(
+            "library_mcp.external_sources.asyncio.create_subprocess_exec",
+            AsyncMock(side_effect=OSError("no such file")),
+        ),
+        pytest.raises(ExternalSourceError),
+    ):
+        await DdgsSource().lookup(httpx.AsyncClient(), "something")
+
+
+async def test_ddgs_lookup_kills_the_worker_and_raises_on_timeout() -> None:
+    proc = _FakeProc()
+
+    async def _hang(_input: bytes) -> tuple[bytes, bytes]:
+        await asyncio.sleep(3600)
+        return b"", b""
+
+    proc.communicate = _hang  # type: ignore[method-assign]
+
+    with (
+        _patch_subprocess(proc),
+        patch("library_mcp.external_sources._DDGS_SUBPROCESS_TIMEOUT", 0.01),
+        pytest.raises(ExternalSourceError),
+    ):
+        await DdgsSource().lookup(httpx.AsyncClient(), "something")
+    assert proc.killed
+    assert proc.waited
+
+
+async def test_ddgs_health_check_true_on_success() -> None:
+    proc = _FakeProc(stdout=json.dumps({"ok": True, "results": []}).encode())
+    with _patch_subprocess(proc):
+        assert await DdgsSource().health_check(httpx.AsyncClient()) is True
+
+
+async def test_ddgs_health_check_false_on_failure() -> None:
+    proc = _FakeProc(stdout=json.dumps({"ok": False, "error": "boom"}).encode())
+    with _patch_subprocess(proc):
+        assert await DdgsSource().health_check(httpx.AsyncClient()) is False

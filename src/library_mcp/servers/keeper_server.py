@@ -17,11 +17,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal
 
+import httpx
 from mcp.server.fastmcp import FastMCP
 
 from library_mcp.audit import AuditLog, Event
 from library_mcp.config import KeeperPolicy, PolicyError, load_keeper_policy, policy_path_from_env
 from library_mcp.embedding import EmbeddingClient, EmbeddingError
+from library_mcp.external_sources import DdgsSource, ExternalResult, ExternalSourceError
 from library_mcp.keeper_model import AnswerDecision, ReasoningClient, ReasoningError, SearchDecision
 from library_mcp.runtime import audit_from_env, build_app, serve
 from library_mcp.store import (
@@ -314,22 +316,51 @@ _REPEATED_QUERY_INTERIM_REPLY = (
 )
 
 
+_WEB_FALLBACK_TEMPLATE = (
+    "The book doesn't cover this. A live web search found:\n\n"
+    "{extract}\n\n"
+    "(Source: {url} -- not from the book; not independently verified.)"
+)
+
+
+async def _try_live_web_fallback(deps: _Deps, question: str) -> ExternalResult | None:
+    """Best-effort live web search for the two "book search came up empty"
+    outcomes, tried within the same turn rather than only via the nightly
+    gap-research pipeline. Fails open on purpose: ANY failure (timeout,
+    worker crash, no results) returns None so the caller falls back to the
+    existing honest interim reply unchanged -- a broken web search must
+    never surface as an error to the user, or block the answer path that
+    already worked before this feature existed."""
+    try:
+        async with httpx.AsyncClient() as client:
+            result = await DdgsSource().lookup(client, question)
+    except ExternalSourceError as exc:
+        deps.audit.write(Event.LIVE_WEB_FALLBACK, detail=question, used=False, reason=str(exc))
+        return None
+    deps.audit.write(Event.LIVE_WEB_FALLBACK, detail=question, used=result is not None)
+    return result
+
+
 async def _ask(deps: _Deps, question: str) -> str:
     """Thin wrapper preserving `ask_library`'s `question: str -> str` MCP
     contract exactly (§2, §5): the frontier model still just gets an
     answer string back. Applies the Stage 2->3 escalation trigger (§3-4):
-    an honest interim reply for the two structurally-detected "no real
-    answer" outcomes, and the outcome's own text unchanged for everything
-    else (a real answer, or an infra failure that must not be reframed as
-    a knowledge gap). Stage 3 itself is not triggered here -- the escalated
-    gap is already a normal `knowledge_gaps` row via `_ask_structured()`'s
-    unchanged `record_knowledge_gap` call, picked up by the existing
-    nightly `gap_research.py` path with zero new code (§7 build plan, step
-    6 onward is explicitly out of scope for this build)."""
+    for the two structurally-detected "no real answer" outcomes, tries a
+    live web search first (§ live web fallback) and only falls back to the
+    honest interim reply if that also comes up empty; the outcome's own
+    text is returned unchanged for everything else (a real answer, or an
+    infra failure that must not be reframed as a knowledge gap). The
+    `knowledge_gaps` row from `_ask_structured()` is recorded either way --
+    a live web answer doesn't mean the book covers it, so the nightly
+    `gap_research.py` path (and the case for eventually adding the source
+    to the book collection) is unaffected."""
     outcome = await _ask_structured(deps, question)
-    if outcome.status == "no_matches":
-        return _NO_MATCHES_INTERIM_REPLY
-    if outcome.status == "repeated_query_no_answer":
+    if outcome.status in ("no_matches", "repeated_query_no_answer"):
+        web_result = await _try_live_web_fallback(deps, question)
+        if web_result is not None:
+            return _WEB_FALLBACK_TEMPLATE.format(extract=web_result.extract, url=web_result.url)
+        if outcome.status == "no_matches":
+            return _NO_MATCHES_INTERIM_REPLY
         return _REPEATED_QUERY_INTERIM_REPLY
     return outcome.text
 
@@ -351,7 +382,10 @@ def build_server(policy: KeeperPolicy, audit: AuditLog) -> FastMCP:
             "skip calling it because an earlier turn already covered similar ground, and never "
             "assume a prior attempt's outcome (success, partial result, or failure) still "
             "applies without calling it again. Use this instead of answering from your own "
-            "memory when the question is about specific book content."
+            "memory when the question is about specific book content. Primarily answers from "
+            "the learned books, but if the books don't cover the question, falls back to a "
+            "live web search and returns that instead -- the reply text itself always makes "
+            "clear which source (book or web) the answer actually came from."
         )
     )
     async def ask_library(question: str) -> str:

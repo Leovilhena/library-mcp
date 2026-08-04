@@ -49,6 +49,12 @@ class Event(StrEnum):
     FOLLOWUP_INJECTED = "followup_injected"
     FOLLOWUP_EXPIRED = "followup_expired"
 
+    # Live web-search fallback within ask_library's own turn (distinct from
+    # the nightly gap-research pipeline's EXTERNAL_SOURCE_* events above --
+    # this happens synchronously inside a live user-facing call, not in the
+    # background).
+    LIVE_WEB_FALLBACK = "live_web_fallback"
+
     # Sandbox-vs-ask_library redirect (docs/incidents/2026-07-30-sandbox
     # -vs-ask-library.md): the gateway's `sandbox_redirect` plugin's
     # `pre_tool_call` hook calls the model-invisible `find_book_by_filename`

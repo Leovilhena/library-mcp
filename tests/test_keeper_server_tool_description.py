@@ -41,3 +41,13 @@ def test_ask_library_description_scopes_reuse_to_the_same_turn(tmp_path: Path) -
     # must be gone -- it's what let a small model over-generalize "already
     # tried this" across turns instead of within one.
     assert "only call it again in the same turn if" not in lowered
+
+
+def test_ask_library_description_discloses_the_live_web_fallback(tmp_path: Path) -> None:
+    # The tool no longer only answers from books -- the description must say
+    # so, and must make clear the reply itself discloses which source (book
+    # or web) an answer actually came from, so the frontier model doesn't
+    # misrepresent a web-sourced answer as book-grounded.
+    desc = _ask_library_description(tmp_path).lower()
+    assert "web search" in desc
+    assert "which source" in desc or "book or web" in desc

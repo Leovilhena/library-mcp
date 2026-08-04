@@ -31,6 +31,14 @@ dependencies = [
   "httpx>=0.28.1",
   "pypdf>=5.1.0",
   "ebooklib>=0.18",
+  # General web search fallback (DdgsSource, external_sources.py) -- no API
+  # key, free. Only ever invoked in a subprocess worker
+  # (_ddgs_worker.py), never imported/called directly in-process: its
+  # underlying native HTTP client can block while holding the GIL, so a
+  # thread-pool timeout cannot reliably cancel a hang (see
+  # hermes-agent's plugins/web/ddgs/provider.py for the incident this
+  # defends against).
+  "ddgs>=9.0.0",
 ]
 
 [project.optional-dependencies]

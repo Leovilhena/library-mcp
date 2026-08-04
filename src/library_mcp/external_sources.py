@@ -28,6 +28,9 @@ implementation in this module, never per-call.
 
 from __future__ import annotations
 
+import asyncio
+import json
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from http import HTTPStatus
@@ -213,7 +216,104 @@ class WikiquoteSource(_MediaWikiSource):
         )
 
 
+# Hard wall-clock cap for the whole subprocess round-trip. Enforced by the
+# parent (`asyncio.wait_for` + kill on expiry), not by DDGS's own
+# per-request `timeout=` alone -- ddgs's internal multi-engine retry loop
+# has no overall cap of its own, so a slow/rate-limited response could hang
+# past any single request's timeout.
+_DDGS_SUBPROCESS_TIMEOUT = 20.0
+_DDGS_MAX_RESULTS = 3
+
+
+class DdgsSource:
+    """General web search via DuckDuckGo (the `ddgs` package) -- the
+    named-but-unbuilt-for-v1 candidate this module's own docstring
+    anticipated. Unlike Wikipedia/Wikiquote, has no fixed-domain REST API
+    to call directly, so `lookup()` shells out to `_ddgs_worker.py` in an
+    isolated subprocess with a hard, killable timeout rather than calling
+    `ddgs` in-process (see that module's docstring for why: its native
+    HTTP client can block while holding the GIL, which a thread-pool
+    timeout cannot reliably cancel).
+
+    The `client: httpx.AsyncClient` parameter on both methods is unused --
+    kept only so this still satisfies `ExternalSource`'s shared shape,
+    since the orchestration layer (gap_research.py) opens one client and
+    passes it to every registered source uniformly.
+    """
+
+    name = "web"
+
+    async def health_check(self, client: httpx.AsyncClient) -> bool:  # noqa: ARG002
+        try:
+            await self._search("test", max_results=1)
+        except ExternalSourceError:
+            return False
+        return True
+
+    async def lookup(self, client: httpx.AsyncClient, question: str) -> ExternalResult | None:  # noqa: ARG002
+        hits = await self._search(question, max_results=_DDGS_MAX_RESULTS)
+        if not hits:
+            return None
+        extract = "\n\n".join(
+            f"{hit['title']}: {hit['body']}".strip(": ")
+            for hit in hits
+            if hit.get("title") or hit.get("body")
+        )[:_EXTRACT_MAX_CHARS]
+        if not extract:
+            return None
+        return ExternalResult(
+            source=self.name,
+            title=question,
+            url=hits[0].get("url", ""),
+            extract=extract,
+            fetched_at=datetime.now(UTC).isoformat(),
+        )
+
+    async def _search(self, query: str, max_results: int) -> list[dict[str, str]]:
+        """Raises `ExternalSourceError` for any transport/subprocess
+        failure -- the worker starting, timing out, or exiting non-zero.
+        An empty (but successful) result list is a real content_miss,
+        returned as `[]`, never an exception."""
+        request = json.dumps({"query": query, "max_results": max_results})
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-m",
+                "library_mcp._ddgs_worker",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            msg = f"web search worker failed to start: {exc}"
+            raise ExternalSourceError(msg) from exc
+
+        try:
+            stdout, _ = await asyncio.wait_for(
+                proc.communicate(request.encode()), timeout=_DDGS_SUBPROCESS_TIMEOUT
+            )
+        except TimeoutError as exc:
+            proc.kill()
+            await proc.wait()
+            msg = f"web search timed out after {_DDGS_SUBPROCESS_TIMEOUT}s"
+            raise ExternalSourceError(msg) from exc
+
+        try:
+            envelope = json.loads(stdout.decode())
+        except (ValueError, UnicodeDecodeError) as exc:
+            msg = f"web search worker returned invalid output: {exc}"
+            raise ExternalSourceError(msg) from exc
+
+        if not isinstance(envelope, dict) or not envelope.get("ok"):
+            error = envelope.get("error") if isinstance(envelope, dict) else envelope
+            msg = f"web search failed: {error}"
+            raise ExternalSourceError(msg)
+        results = envelope.get("results")
+        return results if isinstance(results, list) else []
+
+
 def default_sources() -> list[ExternalSource]:
     """Ordered: Wikipedia first (more likely to have a general answer),
-    Wikiquote second (§3.1)."""
-    return [WikipediaSource(), WikiquoteSource()]
+    Wikiquote second (§3.1), general web search third -- the broadest,
+    least-curated source, tried only after the two more targeted ones."""
+    return [WikipediaSource(), WikiquoteSource(), DdgsSource()]
